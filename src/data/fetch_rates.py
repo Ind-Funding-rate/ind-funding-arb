@@ -42,8 +42,8 @@ logger = logging.getLogger("fetch_rates")
 PAIRS = [
     {
         "name": "BTC",
-        "pi42_symbol": "BTCINR",
-        "pi42_channel": "btcinr@markPrice",
+        "pi42_symbol": "BTCUSDT",
+        "pi42_channel": "btcusdt@markPrice",
         "delta_symbol": "BTCUSD",
         "delta_mark_symbol": "MARK:BTCUSD",
     },
@@ -101,7 +101,7 @@ def display():
         print("-" * 52)
 
         if p:
-            print(f"  PI42   | BTC Price    : ₹{p.get('mark_price', 0):>12,.2f}")
+            print(f"  PI42   | BTC Price    : ${p.get('mark_price', 0):>12,.2f}")
             fr = p.get("funding_rate")
             print(f"         | Funding Rate : {fr*100:>10.6f}%" if fr is not None else "         | Funding Rate : pending...")
         else:

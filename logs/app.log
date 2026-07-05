@@ -47,3 +47,6 @@ ing in 20s...
 2026-06-30 15:17:51,963 [INFO] [fetch_rates] Starting funding rate streamer (real-time WebSocket mode)
 2026-06-30 15:17:58,837 [INFO] [delta_client] connected
 2026-06-30 15:18:02,816 [INFO] [pi42_client] connected
+2026-07-02 22:20:10,654 [INFO] [fetch_rates] Starting funding rate streamer (real-time WebSocket mode)
+2026-07-02 22:20:11,825 [INFO] [delta_client] connected
+2026-07-02 22:20:14,557 [INFO] [pi42_client] connected

@@ -19,7 +19,7 @@ import time
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv("/home/container/bot/.env")  # HidenCloud server path
 
 DELTA_KEY    = os.getenv("DELTA_API_KEY")
 DELTA_SECRET = os.getenv("DELTA_API_SECRET")

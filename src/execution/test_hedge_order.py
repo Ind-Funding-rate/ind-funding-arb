@@ -4,11 +4,18 @@ import hmac
 import hashlib
 import json
 import asyncio
+import csv
+import sys
+from pathlib import Path
+from datetime import datetime
 import websockets
 from dotenv import load_dotenv
 import os
 
 load_dotenv("/home/container/.env")
+
+sys.path.append(str(Path(__file__).resolve().parents[2]))
+from src.alerts.telegram import send_opportunity_alert, send_system_alert
 
 DELTA_KEY    = os.getenv("DELTA_API_KEY")
 DELTA_SECRET = os.getenv("DELTA_API_SECRET")
@@ -32,6 +39,36 @@ DELTA_FEE  = 0.050 * 1.18 / 100   # 0.05900%
 ROUND_TRIP = 2 * (PI42_FEE + DELTA_FEE)  # 4 trades: open+close on both exchanges
 
 PI42_WS_URL = "wss://fawss.pi42.com/socket.io/?EIO=4&transport=websocket"
+
+# Assumed funding interval (Delta confirms 8h for BTCUSD; Pi42's own docs
+# reference the same 5:30am/1:30pm/9:30pm IST schedule - not independently
+# confirmed contract-by-contract, worth double-checking against a real
+# funding reset).
+FUNDING_INTERVAL_HOURS = 8
+
+# Telegram alert cooldown - avoid spamming while a gap stays open
+ALERT_COOLDOWN_SECONDS = 30 * 60  # 30 minutes
+_last_alert_time = 0
+
+# ── CSV LOGGING ─────────────────────────────────────────────────
+# Every cycle's numbers get appended here, regardless of profitability,
+# so we can look back later and answer: does this gap consistently hold
+# up after fees, or was a given reading a fluke?
+LOG_DIR = Path("/home/container/logs")
+LOG_DIR.mkdir(exist_ok=True)
+
+def log_cycle_to_csv(row: dict):
+    log_file = LOG_DIR / f"cycles_{datetime.now().strftime('%Y-%m-%d')}.csv"
+    file_exists = log_file.exists()
+    with open(log_file, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "timestamp", "delta_funding_pct", "pi42_funding_pct",
+            "delta_price", "pi42_price", "gap_pct", "net_edge_pct",
+            "profitable", "direction"
+        ])
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 # -- Helpers --
@@ -91,7 +128,7 @@ def delta_post(path, params):
 # confirmed by inspecting the live response directly, not by guessing.
 # Funding rate is only available in real time via the markPriceUpdate
 # WebSocket event (fields "p" = mark price, "r" = funding rate) - the same
-# format we captured and verified from the real Pi42 website via DevTools.
+# format captured and verified from the real Pi42 website via DevTools.
 # This briefly connects, grabs one live update, and disconnects each cycle.
 async def _fetch_pi42_ws():
     async with websockets.connect(PI42_WS_URL) as ws:
@@ -186,6 +223,8 @@ print(f"  FUNDING ARB EXECUTOR - {'PAPER MODE' if PAPER_MODE else 'LIVE MODE - R
 print("=" * 54)
 print()
 
+send_system_alert(f"Funding arb executor started ({'PAPER MODE' if PAPER_MODE else 'LIVE MODE'})")
+
 cycle = 0
 while True:
     cycle += 1
@@ -225,9 +264,39 @@ while True:
     print(f"  Round-trip fee: {ROUND_TRIP*100:.4f}%")
     print(f"  Net edge      : {net_pct:+.6f}%  {'[PROFITABLE]' if profitable else '[not profitable]'}")
 
+    # Log every cycle to CSV, regardless of profitability
+    log_cycle_to_csv({
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "delta_funding_pct": delta_rate * 100,
+        "pi42_funding_pct": pi42_rate * 100,
+        "delta_price": delta_price,
+        "pi42_price": pi42_price,
+        "gap_pct": gap_pct,
+        "net_edge_pct": net_pct,
+        "profitable": profitable,
+        "direction": f"LONG {long_exchange} / SHORT {short_exchange}" if profitable else "",
+    })
+
     if profitable:
         print(f"  Direction     : LONG {long_exchange} / SHORT {short_exchange}")
         print(f"  Qty per side  : {BTC_QTY} BTC")
+
+        # Send Telegram alert, respecting the cooldown so we don't spam
+        # while the same gap stays open across many cycles.
+        now = time.time()
+        if now - _last_alert_time > ALERT_COOLDOWN_SECONDS:
+            breakeven_payouts = ROUND_TRIP / gap_pct if gap_pct else float("inf")
+            breakeven_hrs = breakeven_payouts * FUNDING_INTERVAL_HOURS
+            sent = send_opportunity_alert(
+                gap_pct=gap_pct,
+                net_pct=net_pct,
+                breakeven_hrs=breakeven_hrs,
+                delta_rate=delta_rate,
+                pi42_rate=pi42_rate,
+            )
+            if sent:
+                _last_alert_time = now
+                print("  [ALERT] Telegram alert sent.")
 
         if PAPER_MODE:
             log_paper_order(long_exchange,  "BUY",  "BTC", BTC_QTY, long_price,  "funding arb - long leg")

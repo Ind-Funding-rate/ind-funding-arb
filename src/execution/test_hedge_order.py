@@ -3,6 +3,8 @@ import time
 import hmac
 import hashlib
 import json
+import asyncio
+import websockets
 from dotenv import load_dotenv
 import os
 
@@ -28,6 +30,8 @@ BTC_QTY = 0.001  # 0.001 BTC per side - smallest allowed on both exchanges
 PI42_FEE   = 0.080 * 1.18 / 100   # 0.09440%
 DELTA_FEE  = 0.050 * 1.18 / 100   # 0.05900%
 ROUND_TRIP = 2 * (PI42_FEE + DELTA_FEE)  # 4 trades: open+close on both exchanges
+
+PI42_WS_URL = "wss://fawss.pi42.com/socket.io/?EIO=4&transport=websocket"
 
 
 # -- Helpers --
@@ -82,6 +86,48 @@ def delta_post(path, params):
     return r.status_code, r.json()
 
 
+# -- Pi42 rate fetch (WebSocket) --
+# Pi42's REST ticker endpoint (ticker24Hr) does NOT include funding rate -
+# confirmed by inspecting the live response directly, not by guessing.
+# Funding rate is only available in real time via the markPriceUpdate
+# WebSocket event (fields "p" = mark price, "r" = funding rate) - the same
+# format we captured and verified from the real Pi42 website via DevTools.
+# This briefly connects, grabs one live update, and disconnects each cycle.
+async def _fetch_pi42_ws():
+    async with websockets.connect(PI42_WS_URL) as ws:
+        await ws.recv()        # Engine.IO handshake info
+        await ws.send("40")    # confirm namespace connect
+        await ws.recv()
+
+        sub_msg = '42["subscribe", {"params": ["btcinr@markPrice"]}]'
+        await ws.send(sub_msg)
+
+        end_time = asyncio.get_event_loop().time() + 8  # give it 8s max to respond
+        while asyncio.get_event_loop().time() < end_time:
+            msg = await asyncio.wait_for(ws.recv(), timeout=8)
+            if msg == "2":
+                await ws.send("3")
+                continue
+            if not msg.startswith("42["):
+                continue
+            payload = json.loads(msg[2:])
+            event_name = payload[0]
+            data = payload[1] if len(payload) > 1 else {}
+            if event_name == "markPriceUpdate" and data.get("s") == "BTCINR":
+                return {
+                    "pi42_price":   float(data.get("p", 0)),
+                    "pi42_funding": float(data.get("r", 0)),
+                }
+    return {}
+
+def fetch_pi42():
+    try:
+        return asyncio.run(_fetch_pi42_ws())
+    except Exception as e:
+        print(f"  [!] Pi42 rate fetch failed: {e}")
+        return {}
+
+
 # -- Fetch live rates --
 
 def get_rates():
@@ -95,14 +141,8 @@ def get_rates():
         rates["delta_funding"] = float(t.get("funding_rate", 0))
     except Exception as e:
         print(f"  [!] Delta rate fetch failed: {e}")
-    try:
-        r = requests.get(
-            "https://api.pi42.com/v1/market/ticker24Hr/BTCINR", timeout=10
-        ).json()
-        rates["pi42_price"]   = float(r.get("lastPrice", 0))
-        rates["pi42_funding"] = float(r.get("fundingRate", 0))
-    except Exception as e:
-        print(f"  [!] Pi42 rate fetch failed: {e}")
+
+    rates.update(fetch_pi42())
     return rates
 
 

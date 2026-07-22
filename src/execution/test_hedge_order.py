@@ -6,7 +6,7 @@ import json
 from dotenv import load_dotenv
 import os
 
-load_dotenv("/home/container/bot/.env")
+load_dotenv("/home/container/.env")
 
 DELTA_KEY    = os.getenv("DELTA_API_KEY")
 DELTA_SECRET = os.getenv("DELTA_API_SECRET")

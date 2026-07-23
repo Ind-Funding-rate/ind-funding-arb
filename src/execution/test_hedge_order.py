@@ -40,20 +40,10 @@ ROUND_TRIP = 2 * (PI42_FEE + DELTA_FEE)  # 4 trades: open+close on both exchange
 
 PI42_WS_URL = "wss://fawss.pi42.com/socket.io/?EIO=4&transport=websocket"
 
-# Assumed funding interval (Delta confirms 8h for BTCUSD; Pi42's own docs
-# reference the same 5:30am/1:30pm/9:30pm IST schedule - not independently
-# confirmed contract-by-contract, worth double-checking against a real
-# funding reset).
 FUNDING_INTERVAL_HOURS = 8
-
-# Telegram alert cooldown - avoid spamming while a gap stays open
-ALERT_COOLDOWN_SECONDS = 30 * 60  # 30 minutes
+ALERT_COOLDOWN_SECONDS = 30 * 60
 _last_alert_time = 0
 
-# ── CSV LOGGING ─────────────────────────────────────────────────
-# Every cycle's numbers get appended here, regardless of profitability,
-# so we can look back later and answer: does this gap consistently hold
-# up after fees, or was a given reading a fluke?
 LOG_DIR = Path("/home/container/logs")
 LOG_DIR.mkdir(exist_ok=True)
 
@@ -124,22 +114,16 @@ def delta_post(path, params):
 
 
 # -- Pi42 rate fetch (WebSocket) --
-# Pi42's REST ticker endpoint (ticker24Hr) does NOT include funding rate -
-# confirmed by inspecting the live response directly, not by guessing.
-# Funding rate is only available in real time via the markPriceUpdate
-# WebSocket event (fields "p" = mark price, "r" = funding rate) - the same
-# format captured and verified from the real Pi42 website via DevTools.
-# This briefly connects, grabs one live update, and disconnects each cycle.
 async def _fetch_pi42_ws():
     async with websockets.connect(PI42_WS_URL) as ws:
-        await ws.recv()        # Engine.IO handshake info
-        await ws.send("40")    # confirm namespace connect
+        await ws.recv()
+        await ws.send("40")
         await ws.recv()
 
         sub_msg = '42["subscribe", {"params": ["btcinr@markPrice"]}]'
         await ws.send(sub_msg)
 
-        end_time = asyncio.get_event_loop().time() + 8  # give it 8s max to respond
+        end_time = asyncio.get_event_loop().time() + 8
         while asyncio.get_event_loop().time() < end_time:
             msg = await asyncio.wait_for(ws.recv(), timeout=8)
             if msg == "2":
@@ -153,7 +137,7 @@ async def _fetch_pi42_ws():
             if event_name == "markPriceUpdate" and data.get("s") == "BTCINR":
                 return {
                     "pi42_price":   float(data.get("p", 0)),
-                    "pi42_funding": float(data.get("r", 0)),
+                    "pi42_funding": float(data.get("r", 0)),  # Pi42: fraction, e.g. -0.0000105 = -0.00105%
                 }
     return {}
 
@@ -174,8 +158,17 @@ def get_rates():
             "https://api.india.delta.exchange/v2/tickers/BTCUSD", timeout=10
         ).json()
         t = r.get("result", {})
-        rates["delta_price"]   = float(t.get("mark_price", 0))
-        rates["delta_funding"] = float(t.get("funding_rate", 0))
+        rates["delta_price"] = float(t.get("mark_price", 0))
+        # IMPORTANT UNIT FIX (confirmed against Delta's live app display,
+        # not guessed): Delta's API returns funding_rate already AS a
+        # percentage value (e.g. raw "0.01" means 0.01%), unlike Pi42's
+        # field which is a true fraction. Dividing by 100 here converts
+        # it to a fraction so it's handled consistently with Pi42 by the
+        # rest of this script (which multiplies by 100 for display).
+        # Without this fix, Delta's rate was being read as 100x too large
+        # (e.g. showing 1.000000% instead of the real 0.010000%).
+        raw_funding = float(t.get("funding_rate", 0))
+        rates["delta_funding"] = raw_funding / 100
     except Exception as e:
         print(f"  [!] Delta rate fetch failed: {e}")
 
@@ -183,14 +176,10 @@ def get_rates():
     return rates
 
 
-# -- Paper order logger --
-
 def log_paper_order(exchange, side, symbol, qty, price, reason):
     print(f"  [PAPER] WOULD PLACE -> {exchange} | {side} {qty} {symbol} "
           f"@ ~{price:.2f} | {reason}")
 
-
-# -- Real order placement --
 
 def place_pi42_order(side, qty):
     params = {
@@ -216,14 +205,13 @@ def place_delta_order(side, qty):
     return delta_post("/v2/orders", params)
 
 
-# -- Main loop --
-
 print("=" * 54)
 print(f"  FUNDING ARB EXECUTOR - {'PAPER MODE' if PAPER_MODE else 'LIVE MODE - REAL MONEY'}")
+print("  [FIXED] Delta funding rate unit corrected (was 100x too large)")
 print("=" * 54)
 print()
 
-send_system_alert(f"Funding arb executor started ({'PAPER MODE' if PAPER_MODE else 'LIVE MODE'})")
+send_system_alert(f"Funding arb executor started ({'PAPER MODE' if PAPER_MODE else 'LIVE MODE'}) - Delta funding unit fix applied")
 
 cycle = 0
 while True:
@@ -264,7 +252,6 @@ while True:
     print(f"  Round-trip fee: {ROUND_TRIP*100:.4f}%")
     print(f"  Net edge      : {net_pct:+.6f}%  {'[PROFITABLE]' if profitable else '[not profitable]'}")
 
-    # Log every cycle to CSV, regardless of profitability
     log_cycle_to_csv({
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "delta_funding_pct": delta_rate * 100,
@@ -281,8 +268,6 @@ while True:
         print(f"  Direction     : LONG {long_exchange} / SHORT {short_exchange}")
         print(f"  Qty per side  : {BTC_QTY} BTC")
 
-        # Send Telegram alert, respecting the cooldown so we don't spam
-        # while the same gap stays open across many cycles.
         now = time.time()
         if now - _last_alert_time > ALERT_COOLDOWN_SECONDS:
             breakeven_payouts = ROUND_TRIP / gap_pct if gap_pct else float("inf")

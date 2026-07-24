@@ -36,10 +36,11 @@ app = Flask(__name__)
 # scanner table - not a hard filter, just a signal to look closer.
 LOW_LIQUIDITY_USD = 50_000
 
-# Coins offered in the multi-exchange backtest dropdown - liquid, widely
-# listed as perpetuals across Binance/Bybit/OKX (unlike many of the 133
-# coins in the main scanner, which are Pi42/Delta-specific and often
-# aren't listed on these exchanges at all).
+# Coins SUGGESTED in the multi-exchange backtest search box - liquid,
+# widely listed as perpetuals across Binance/Bybit/OKX. This is only a
+# suggestion list (via <datalist>) - the field is a free-text input, so
+# any coin ticker can still be typed and submitted even if it's not in
+# this list (e.g. a newer or less common listing).
 MULTI_BACKTEST_COINS = [
     "BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "LINK", "AVAX", "DOT",
     "LTC", "BCH", "UNI", "SUI", "TRX", "NEAR", "OP", "INJ", "RUNE",
@@ -199,8 +200,11 @@ MULTI_BACKTEST_PAGE = """
     <select name="exchange_a">{exchange_a_options}</select></div>
   <div><label>Short exchange</label>
     <select name="exchange_b">{exchange_b_options}</select></div>
-  <div><label>Coin</label>
-    <select name="coin">{coin_options}</select></div>
+  <div><label>Coin (type to search)</label>
+    <input list="coin-suggestions" name="coin" value="{coin}" style="width:110px"
+           placeholder="e.g. BTC" autocomplete="off">
+    <datalist id="coin-suggestions">{coin_datalist}</datalist>
+  </div>
   <div><label>Days</label><input name="days" type="number" value="{days}" style="width:70px"></div>
   <div><label>Position ($)</label><input name="position" type="number" value="{position}" style="width:110px"></div>
   <button type="submit">Run backtest</button>
@@ -210,10 +214,10 @@ MULTI_BACKTEST_PAGE = """
   Uses real historical funding rate data from Binance, Bybit, and OKX -
   their own free, public APIs (weeks/months of real history), not just
   our own logged data. Pi42 and Delta India are not included here since
-  neither publishes historical funding data anywhere. Coin list above is
-  limited to coins reliably listed as perpetuals across these three
-  exchanges (unlike the main scanner's 133 coins, which are Pi42/Delta
-  specific and mostly won't exist on Binance/Bybit/OKX).
+  neither publishes historical funding data anywhere. The coin field
+  suggests common tickers as you type but accepts any ticker - if an
+  unlisted one returns "no matched data", it likely isn't a perpetual on
+  one of the two selected exchanges.
 </div>
 </body></html>
 """
@@ -348,18 +352,15 @@ def render_multi_backtest_page():
             for e in exchanges
         )
 
-    def coin_options(selected):
-        return "".join(
-            f'<option value="{c}" {"selected" if c == selected else ""}>{c}</option>'
-            for c in MULTI_BACKTEST_COINS
-        )
+    def coin_datalist():
+        return "".join(f'<option value="{c}">' for c in MULTI_BACKTEST_COINS)
 
     nav = NAV.format(scanner_active="", backtest_active="", multi_active="active")
     return MULTI_BACKTEST_PAGE.format(
         css=BASE_CSS, nav=nav,
         exchange_a_options=exchange_options(exchange_a),
         exchange_b_options=exchange_options(exchange_b),
-        coin_options=coin_options(coin),
+        coin=coin, coin_datalist=coin_datalist(),
         days=days, position=int(position), result_html=result_html,
     )
 

@@ -214,8 +214,8 @@ def render_scanner_page():
         profitable_count = sum(1 for r in _latest_rows if r["profitable"])
         status = (
             f"Last scan: {_last_scan_time.strftime('%H:%M:%S')} "
-            f"({int(age)}s ago) · {len(_latest_rows)} coins checked · "
-            f"{profitable_count} profitable · fee floor {ROUND_TRIP*100:.4f}% · "
+            f"({int(age)}s ago) \u00b7 {len(_latest_rows)} coins checked \u00b7 "
+            f"{profitable_count} profitable \u00b7 fee floor {ROUND_TRIP*100:.4f}% \u00b7 "
             f"type to filter, click headers to sort"
         )
 
@@ -304,7 +304,7 @@ def render_multi_backtest_page():
             f'<div class="note">Got {result.get("points_a", 0)} points from '
             f'{exchange_a} and {result.get("points_b", 0)} from {exchange_b}. '
             f'This coin may not be listed as a perpetual on one of these exchanges, '
-            f'or the symbol format didn\\'t match - double check the coin ticker.</div></div>'
+            f'or the symbol format did not match - double check the coin ticker.</div></div>'
         )
     else:
         result_html = f"""

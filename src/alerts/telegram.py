@@ -26,7 +26,7 @@ def send_telegram(message: str) -> bool:
         print(f"  [ALERT ERROR] {e}")
         return False
 
-# ── OPPORTUNITY ALERT ─────────────────────────────────────────
+# ── OPPORTUNITY ALERT (single pair, BTC-only executor) ────────
 def send_opportunity_alert(gap_pct: float, net_pct: float,
                            breakeven_hrs: float,
                            delta_rate: float, pi42_rate: float):
@@ -40,6 +40,27 @@ def send_opportunity_alert(gap_pct: float, net_pct: float,
         f"📊 <b>GAP</b>         : {gap_pct:.4f} pp\n"
         f"💰 <b>NET PROFIT</b>  : +{net_pct:.4f}%\n"
         f"⏱ <b>Breakeven</b>   : {breakeven_hrs:.1f} hrs\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    return send_telegram(message)
+
+# ── MULTI-COIN OPPORTUNITY ALERT (full market scanner) ─────────
+def send_multi_opportunity_alert(coin: str, gap_pct: float, net_pct: float,
+                                  delta_rate: float, pi42_rate: float,
+                                  delta_volume_usd: float):
+    """Send alert when a profitable opportunity is detected on a specific
+    coin during a full-market scan. Includes volume so a thin/illiquid
+    false-positive can be judged at a glance."""
+    message = (
+        f"🚨 <b>FUNDING ARB OPPORTUNITY: {coin}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 <b>Delta Rate</b>  : {delta_rate*100:.4f}%\n"
+        f"📉 <b>Pi42 Rate</b>   : {pi42_rate*100:.4f}%\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>GAP</b>         : {gap_pct:.4f} pp\n"
+        f"💰 <b>NET PROFIT</b>  : +{net_pct:.4f}%\n"
+        f"💧 <b>Delta 24h Vol</b>: ${delta_volume_usd:,.0f}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )

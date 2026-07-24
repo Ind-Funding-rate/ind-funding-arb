@@ -8,6 +8,10 @@ everything to CSV, and sends a Telegram alert (per-coin cooldown) the
 moment any coin shows a genuinely profitable gap after fees.
 
 This does NOT place any orders - detection and alerting only.
+
+run_scan_cycle() returns the scanned rows so other code (e.g. the web
+dashboard) can display the same live results without duplicating the
+fetch/compute logic or hitting the exchanges twice.
 """
 import requests
 import time
@@ -26,18 +30,15 @@ load_dotenv("/home/container/.env")
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 from src.alerts.telegram import send_multi_opportunity_alert, send_system_alert
 
-# Fee constants (confirmed from official fee pages, taker + 18% GST)
 PI42_FEE   = 0.080 * 1.18 / 100
 DELTA_FEE  = 0.050 * 1.18 / 100
-ROUND_TRIP = 2 * (PI42_FEE + DELTA_FEE)  # as a fraction
+ROUND_TRIP = 2 * (PI42_FEE + DELTA_FEE)
 
 PI42_WS_URL = "wss://fawss.pi42.com/socket.io/?EIO=4&transport=websocket"
 
-CYCLE_SECONDS = 90            # full scan takes ~20-25s, so this gives breathing room
-PER_COIN_COOLDOWN_SECONDS = 30 * 60   # 30 min before re-alerting the same coin
+CYCLE_SECONDS = 90
+PER_COIN_COOLDOWN_SECONDS = 30 * 60
 
-# Full overlap list - every coin confirmed live on BOTH Delta (xUSD) and
-# Pi42 (xINR), captured directly from both exchanges' own APIs.
 COINS = [
     "1000BONK", "1000FLOKI", "1000PEPE", "1000SATS", "1000SHIB", "1MBABYDOGE",
     "AAVE", "ACT", "ADA", "AIXBT", "AKE", "ALLO", "API3", "APT", "AR", "ARB",
@@ -60,7 +61,7 @@ COINS = [
 LOG_DIR = Path("/home/container/logs")
 LOG_DIR.mkdir(exist_ok=True)
 
-_last_alert_time = {}  # coin -> timestamp of last alert
+_last_alert_time = {}
 
 
 def log_scan_to_csv(rows):
@@ -87,8 +88,6 @@ def get_delta_funding_all():
             raw = t.get("funding_rate")
             vol = t.get("turnover_usd") or t.get("volume")
             if raw is not None:
-                # Same unit fix as the main executor: Delta's funding_rate
-                # is already a percentage, not a fraction - divide by 100.
                 out[base] = {
                     "funding": float(raw) / 100,
                     "volume_usd": float(vol) if vol else 0,
@@ -138,6 +137,10 @@ def get_pi42_funding_all(symbols):
 
 
 def run_scan_cycle():
+    """Runs one full scan across all COINS. Returns the list of result
+    rows (also logs them to CSV and sends any due Telegram alerts as a
+    side effect) so callers - like a web dashboard - can display the
+    same data without a second round of exchange calls."""
     delta_data = get_delta_funding_all()
     pi42_data = get_pi42_funding_all(COINS)
 
@@ -190,7 +193,11 @@ def run_scan_cycle():
             )
             _last_alert_time[coin] = now
         else:
-            print(f"    -> {coin} profitable but in cooldown ({int((PER_COIN_COOLDOWN_SECONDS-(now-last))/60)}m left)")
+            print(f"    -> {coin} profitable but in cooldown "
+                  f"({int((PER_COIN_COOLDOWN_SECONDS-(now-last))/60)}m left)")
+
+    rows.sort(key=lambda r: r["net_pct"], reverse=True)
+    return rows
 
 
 if __name__ == "__main__":

@@ -36,6 +36,17 @@ app = Flask(__name__)
 # scanner table - not a hard filter, just a signal to look closer.
 LOW_LIQUIDITY_USD = 50_000
 
+# Coins offered in the multi-exchange backtest dropdown - liquid, widely
+# listed as perpetuals across Binance/Bybit/OKX (unlike many of the 133
+# coins in the main scanner, which are Pi42/Delta-specific and often
+# aren't listed on these exchanges at all).
+MULTI_BACKTEST_COINS = [
+    "BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "LINK", "AVAX", "DOT",
+    "LTC", "BCH", "UNI", "SUI", "TRX", "NEAR", "OP", "INJ", "RUNE",
+    "SEI", "ARB", "APT", "TIA", "JUP", "WIF", "PEPE", "BNB", "ETC",
+    "FIL", "HBAR", "ICP", "AAVE", "MKR", "LDO", "GALA", "SAND",
+]
+
 # ── SHARED STATE (updated by the background scan thread) ──────
 _latest_rows = []
 _last_scan_time = None
@@ -188,7 +199,8 @@ MULTI_BACKTEST_PAGE = """
     <select name="exchange_a">{exchange_a_options}</select></div>
   <div><label>Short exchange</label>
     <select name="exchange_b">{exchange_b_options}</select></div>
-  <div><label>Coin</label><input name="coin" value="{coin}" style="width:90px"></div>
+  <div><label>Coin</label>
+    <select name="coin">{coin_options}</select></div>
   <div><label>Days</label><input name="days" type="number" value="{days}" style="width:70px"></div>
   <div><label>Position ($)</label><input name="position" type="number" value="{position}" style="width:110px"></div>
   <button type="submit">Run backtest</button>
@@ -198,7 +210,10 @@ MULTI_BACKTEST_PAGE = """
   Uses real historical funding rate data from Binance, Bybit, and OKX -
   their own free, public APIs (weeks/months of real history), not just
   our own logged data. Pi42 and Delta India are not included here since
-  neither publishes historical funding data anywhere.
+  neither publishes historical funding data anywhere. Coin list above is
+  limited to coins reliably listed as perpetuals across these three
+  exchanges (unlike the main scanner's 133 coins, which are Pi42/Delta
+  specific and mostly won't exist on Binance/Bybit/OKX).
 </div>
 </body></html>
 """
@@ -289,8 +304,8 @@ def render_backtest_page():
 
 def render_multi_backtest_page():
     exchanges = ["binance", "bybit", "okx"]
-    exchange_a = request.args.get("exchange_a", "binance")
-    exchange_b = request.args.get("exchange_b", "bybit")
+    exchange_a = request.args.get("exchange_a", "bybit")
+    exchange_b = request.args.get("exchange_b", "okx")
     coin = request.args.get("coin", "BTC").upper()
     days = int(request.args.get("days", 30))
     position = float(request.args.get("position", 1000))
@@ -304,7 +319,10 @@ def render_multi_backtest_page():
             f'<div class="note">Got {result.get("points_a", 0)} points from '
             f'{exchange_a} and {result.get("points_b", 0)} from {exchange_b}. '
             f'This coin may not be listed as a perpetual on one of these exchanges, '
-            f'or the symbol format did not match - double check the coin ticker.</div></div>'
+            f'or the symbol format did not match - double check the coin ticker. '
+            f'Note: Binance has been unreliable from this server (connection '
+            f'timeouts) - try Bybit vs OKX instead if Binance is one of your '
+            f'selections.</div></div>'
         )
     else:
         result_html = f"""
@@ -324,17 +342,25 @@ def render_multi_backtest_page():
         </div>
         """
 
-    def options(selected):
+    def exchange_options(selected):
         return "".join(
             f'<option value="{e}" {"selected" if e == selected else ""}>{e.capitalize()}</option>'
             for e in exchanges
         )
 
+    def coin_options(selected):
+        return "".join(
+            f'<option value="{c}" {"selected" if c == selected else ""}>{c}</option>'
+            for c in MULTI_BACKTEST_COINS
+        )
+
     nav = NAV.format(scanner_active="", backtest_active="", multi_active="active")
     return MULTI_BACKTEST_PAGE.format(
         css=BASE_CSS, nav=nav,
-        exchange_a_options=options(exchange_a), exchange_b_options=options(exchange_b),
-        coin=coin, days=days, position=int(position), result_html=result_html,
+        exchange_a_options=exchange_options(exchange_a),
+        exchange_b_options=exchange_options(exchange_b),
+        coin_options=coin_options(coin),
+        days=days, position=int(position), result_html=result_html,
     )
 
 

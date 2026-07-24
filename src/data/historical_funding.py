@@ -31,7 +31,7 @@ def get_binance_history(coin: str, days: int):
     r = requests.get(
         "https://fapi.binance.com/fapi/v1/fundingRate",
         params={"symbol": symbol, "startTime": start_ms, "limit": 1000},
-        timeout=15,
+        timeout=25,
     )
     r.raise_for_status()
     data = r.json()
@@ -42,15 +42,29 @@ def get_binance_history(coin: str, days: int):
 
 
 def get_bybit_history(coin: str, days: int):
+    # Bybit's own docs are explicit: passing only startTime (without
+    # endTime) returns an error - both must be supplied together.
+    # This was a real bug in the previous version of this file, not
+    # a network issue - confirmed against Bybit's official API docs.
     symbol = f"{coin}USDT"
     start_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+    end_ms = int(datetime.now().timestamp() * 1000)
     r = requests.get(
         "https://api.bybit.com/v5/market/funding/history",
-        params={"category": "linear", "symbol": symbol, "startTime": start_ms, "limit": 200},
-        timeout=15,
+        params={
+            "category": "linear",
+            "symbol": symbol,
+            "startTime": start_ms,
+            "endTime": end_ms,
+            "limit": 200,
+        },
+        timeout=25,
     )
     r.raise_for_status()
-    data = r.json().get("result", {}).get("list", [])
+    body = r.json()
+    if body.get("retCode") != 0:
+        raise RuntimeError(f"Bybit API error: {body.get('retMsg')}")
+    data = body.get("result", {}).get("list", [])
     return [
         {"time": datetime.fromtimestamp(int(d["fundingRateTimestamp"]) / 1000), "rate": float(d["fundingRate"])}
         for d in data
@@ -62,10 +76,13 @@ def get_okx_history(coin: str, days: int):
     r = requests.get(
         "https://www.okx.com/api/v5/public/funding-rate-history",
         params={"instId": inst_id, "limit": 100},
-        timeout=15,
+        timeout=25,
     )
     r.raise_for_status()
-    data = r.json().get("data", [])
+    body = r.json()
+    if body.get("code") != "0":
+        raise RuntimeError(f"OKX API error: {body.get('msg')}")
+    data = body.get("data", [])
     cutoff = datetime.now() - timedelta(days=days)
     rows = [
         {"time": datetime.fromtimestamp(int(d["fundingTime"]) / 1000), "rate": float(d["fundingRate"])}
@@ -84,7 +101,8 @@ FETCHERS = {
 def get_history(exchange: str, coin: str, days: int):
     """exchange: one of 'binance', 'bybit', 'okx'. Returns [] on any error
     (bad symbol, network issue, etc.) rather than raising, so callers can
-    handle 'no data' uniformly."""
+    handle 'no data' uniformly. Prints the real error so it's visible in
+    the console instead of silently disappearing."""
     fetcher = FETCHERS.get(exchange.lower())
     if not fetcher:
         return []
@@ -93,5 +111,5 @@ def get_history(exchange: str, coin: str, days: int):
         rows.sort(key=lambda r: r["time"])
         return rows
     except Exception as e:
-        print(f"  [!] {exchange} history fetch failed for {coin}: {e}")
+        print(f"  [!] {exchange} history fetch failed for {coin}: {type(e).__name__}: {e}")
         return []

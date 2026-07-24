@@ -12,12 +12,13 @@ been running and logging. On day one, that's ~0 days of data and results
 will be empty. The longer full_market_scanner.py runs, the more useful
 this becomes.
 
-Usage:
+compute_backtest() returns a structured dict (used by both the CLI below
+and the web dashboard) so the logic lives in exactly one place.
+
+CLI usage:
     python src/execution/backtest_engine.py --coin BTC --days 7 --position 1000
-    python src/execution/backtest_engine.py --coin ETH --days 30 --position 5000
 """
 import csv
-import sys
 import argparse
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -26,7 +27,7 @@ LOG_DIR = Path("/home/container/logs")
 
 PI42_FEE   = 0.080 * 1.18 / 100
 DELTA_FEE  = 0.050 * 1.18 / 100
-ROUND_TRIP_PCT = 2 * (PI42_FEE + DELTA_FEE) * 100  # as a percentage
+ROUND_TRIP_PCT = 2 * (PI42_FEE + DELTA_FEE) * 100
 
 
 def load_rows(coin: str, days: int):
@@ -55,33 +56,22 @@ def load_rows(coin: str, days: int):
     return rows
 
 
-def backtest(coin: str, days: int, position_usd: float):
+def compute_backtest(coin: str, days: int, position_usd: float) -> dict:
+    """Returns a dict describing the simulated backtest result. Always
+    returns a dict (never raises for 'no data' - check result['enough_data'])."""
     rows = load_rows(coin, days)
 
-    print("=" * 60)
-    print(f"  BACKTEST: {coin}  |  last {days} day(s)  |  ${position_usd:,.0f} position")
-    print("=" * 60)
-
     if len(rows) < 2:
-        print(f"  Not enough logged data yet for {coin} over this period.")
-        print(f"  Found {len(rows)} data point(s).")
-        print()
-        print("  This is expected if full_market_scanner.py has only been")
-        print("  running for a short time. Historical data builds up the")
-        print("  longer it runs - come back after a few days for a real")
-        print("  backtest. We don't have (and can't get) funding history")
-        print("  from before the scanner started, since Pi42 has no")
-        print("  historical funding-rate API.")
-        return
+        return {
+            "coin": coin,
+            "days": days,
+            "position_usd": position_usd,
+            "enough_data": False,
+            "data_points": len(rows),
+        }
 
-    # Simulate: accrue the funding differential between consecutive
-    # readings, weighted by actual elapsed time (since our polling
-    # interval isn't exactly aligned to funding payout times, this is
-    # a time-weighted approximation of continuous accrual, not literal
-    # payout-by-payout accounting).
     total_return_pct = 0.0
     entered = False
-    entry_time = None
     time_in_position_hours = 0.0
 
     for i in range(1, len(rows)):
@@ -93,11 +83,7 @@ def backtest(coin: str, days: int, position_usd: float):
         profitable = prev_row["profitable"] == "True"
 
         if profitable:
-            if not entered:
-                entered = True
-                entry_time = prev_ts
-            # Funding accrues continuously; net_pct is per-8h-cycle edge,
-            # so scale it down to this actual elapsed slice.
+            entered = True
             per_hour_pct = net_pct / 8
             total_return_pct += per_hour_pct * elapsed_hours
             time_in_position_hours += elapsed_hours
@@ -107,14 +93,50 @@ def backtest(coin: str, days: int, position_usd: float):
     position_pnl_usd = position_usd * (total_return_pct / 100)
     days_covered = (rows[-1][0] - rows[0][0]).total_seconds() / 86400
     apy_pct = (total_return_pct / days_covered * 365) if days_covered > 0 else 0
+    pct_time_profitable = (
+        time_in_position_hours / (days_covered * 24) * 100 if days_covered else 0
+    )
 
-    print(f"  Data points               : {len(rows)}")
-    print(f"  Period covered            : {days_covered:.2f} days")
-    print(f"  Time in profitable state  : {time_in_position_hours:.1f} hours "
-          f"({time_in_position_hours / (days_covered*24) * 100 if days_covered else 0:.1f}% of period)")
-    print(f"  Simulated total return    : {total_return_pct:+.4f}%")
-    print(f"  Simulated P&L on ${position_usd:,.0f}  : ${position_pnl_usd:+,.2f}")
-    print(f"  Annualized (APY)          : {apy_pct:+.2f}%")
+    return {
+        "coin": coin,
+        "days": days,
+        "position_usd": position_usd,
+        "enough_data": True,
+        "data_points": len(rows),
+        "days_covered": round(days_covered, 2),
+        "time_in_position_hours": round(time_in_position_hours, 1),
+        "pct_time_profitable": round(pct_time_profitable, 1),
+        "total_return_pct": round(total_return_pct, 4),
+        "position_pnl_usd": round(position_pnl_usd, 2),
+        "apy_pct": round(apy_pct, 2),
+    }
+
+
+def print_backtest(result: dict):
+    print("=" * 60)
+    print(f"  BACKTEST: {result['coin']}  |  last {result['days']} day(s)  |  "
+          f"${result['position_usd']:,.0f} position")
+    print("=" * 60)
+
+    if not result["enough_data"]:
+        print(f"  Not enough logged data yet for {result['coin']} over this period.")
+        print(f"  Found {result['data_points']} data point(s).")
+        print()
+        print("  This is expected if full_market_scanner.py has only been")
+        print("  running for a short time. Come back after a few days for")
+        print("  a real backtest. We don't have (and can't get) funding")
+        print("  history from before the scanner started, since Pi42 has")
+        print("  no historical funding-rate API.")
+        return
+
+    print(f"  Data points               : {result['data_points']}")
+    print(f"  Period covered            : {result['days_covered']} days")
+    print(f"  Time in profitable state  : {result['time_in_position_hours']} hours "
+          f"({result['pct_time_profitable']}% of period)")
+    print(f"  Simulated total return    : {result['total_return_pct']:+.4f}%")
+    print(f"  Simulated P&L on ${result['position_usd']:,.0f}  : "
+          f"${result['position_pnl_usd']:+,.2f}")
+    print(f"  Annualized (APY)          : {result['apy_pct']:+.2f}%")
     print()
     print("  NOTE: this simulates HOLDING the position only while the")
     print("  logged data showed a profitable net edge, and assumes fees")
@@ -131,4 +153,5 @@ if __name__ == "__main__":
     parser.add_argument("--position", type=float, default=1000)
     args = parser.parse_args()
 
-    backtest(args.coin, args.days, args.position)
+    result = compute_backtest(args.coin, args.days, args.position)
+    print_backtest(result)

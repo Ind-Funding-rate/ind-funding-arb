@@ -1,15 +1,18 @@
 """
 Minimal web dashboard - 4 pages: live scanner, Delta/Pi42 backtest (our
 own logged data), multi-exchange historical backtest, and an automated
-opportunity matrix scanner across many coins x exchange pairs at once.
+opportunity matrix scanner across ALL available coins x exchange pairs.
 
-Runs the full-market scanner continuously in a background thread (so we
-never stop monitoring), keeps the latest results in memory, and serves
-them as plain server-rendered HTML - no JS framework, no build step,
-loads fast on a free-tier server. A small amount of vanilla JS handles
-the scanner's search box, sortable columns, and the coin autocomplete
-(built as custom JS rather than native <datalist>, which has inconsistent
-support on some mobile browsers).
+Runs two background threads continuously:
+1. The live full-market scanner (Delta vs Pi42, 133 coins, every ~90s)
+2. The historical opportunity matrix scanner (ALL coins common to Bybit
+   and OKX - dynamically fetched, can be a few hundred - every 3 hours,
+   since it makes many real API calls and funding data only updates
+   every 8h anyway)
+
+Both keep their latest results in memory and are served as plain
+server-rendered HTML - no JS framework, no build step, loads fast on a
+free-tier server.
 
 Binds to whatever port HidenCloud/Pterodactyl assigns via the SERVER_PORT
 env var (falls back to 8080 if not set, for local testing).
@@ -24,7 +27,7 @@ import os
 
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 
-from flask import Flask, request, render_template_string
+from flask import Flask, request, redirect
 from dotenv import load_dotenv
 
 load_dotenv("/home/container/.env")
@@ -32,17 +35,15 @@ load_dotenv("/home/container/.env")
 from src.execution.full_market_scanner import run_scan_cycle, CYCLE_SECONDS, ROUND_TRIP
 from src.execution.backtest_engine import compute_backtest
 from src.execution.multi_exchange_backtest import compute_multi_backtest, GENERIC_ROUND_TRIP_PCT
-from src.execution.advanced_backtest import compute_advanced_backtest, find_best_pair, scan_opportunity_matrix
+from src.execution.advanced_backtest import (
+    compute_advanced_backtest, find_best_pair, scan_opportunity_matrix,
+    get_full_common_coin_universe,
+)
 
 app = Flask(__name__)
 
-# Low-liquidity threshold used only to visually flag thin coins in the
-# scanner table - not a hard filter, just a signal to look closer.
 LOW_LIQUIDITY_USD = 50_000
 
-# Coins SUGGESTED in the multi-exchange backtest search box, and used as
-# the universe for the opportunity matrix scan - liquid, widely listed as
-# perpetuals across Binance/Bybit/OKX.
 MULTI_BACKTEST_COINS = [
     "BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "LINK", "AVAX", "DOT",
     "LTC", "BCH", "UNI", "SUI", "TRX", "NEAR", "OP", "INJ", "RUNE",
@@ -50,7 +51,9 @@ MULTI_BACKTEST_COINS = [
     "FIL", "HBAR", "ICP", "AAVE", "MKR", "LDO", "GALA", "SAND",
 ]
 
-# ── SHARED STATE (updated by the background scan thread) ──────
+OPPORTUNITY_RESCAN_SECONDS = 3 * 60 * 60  # 3 hours between full scans
+
+# ── SHARED STATE: live scanner (Delta vs Pi42) ─────────────────
 _latest_rows = []
 _last_scan_time = None
 _scan_error = None
@@ -67,6 +70,50 @@ def background_scanner():
             _scan_error = str(e)
             print(f"[web] scan cycle failed: {e}")
         time.sleep(CYCLE_SECONDS)
+
+
+# ── SHARED STATE: opportunity matrix (ALL coins, Bybit/OKX historical) ─
+_opp_results = []
+_opp_last_run = None
+_opp_running = False
+_opp_progress = (0, 0)
+_opp_coin_universe = []
+_opp_error = None
+
+
+def run_full_opportunity_scan(days=14, position=1000):
+    global _opp_results, _opp_last_run, _opp_running, _opp_progress, _opp_coin_universe, _opp_error
+    if _opp_running:
+        return
+    _opp_running = True
+    _opp_error = None
+    try:
+        if not _opp_coin_universe:
+            print("[web] fetching full Bybit/OKX coin universe...")
+            _opp_coin_universe = get_full_common_coin_universe()
+            print(f"[web] found {len(_opp_coin_universe)} coins common to both exchanges")
+
+        def progress_cb(done, total):
+            global _opp_progress
+            _opp_progress = (done, total)
+
+        results = scan_opportunity_matrix(
+            _opp_coin_universe, days, position, progress_callback=progress_cb
+        )
+        _opp_results = results
+        _opp_last_run = datetime.now()
+    except Exception as e:
+        _opp_error = str(e)
+        print(f"[web] opportunity scan failed: {e}")
+    finally:
+        _opp_running = False
+        _opp_progress = (0, 0)
+
+
+def opportunity_background():
+    while True:
+        run_full_opportunity_scan()
+        time.sleep(OPPORTUNITY_RESCAN_SECONDS)
 
 
 # ── SHARED PAGE STYLE ────────────────────────────────────────
@@ -99,6 +146,7 @@ BASE_CSS = """
                   padding:8px 10px; border-radius:6px; font-size:14px; }
   button { background:#4ade80; color:#0f1117; border:none; padding:9px 18px;
            border-radius:6px; font-weight:700; cursor:pointer; }
+  button.secondary { background:#2a2d38; color:#e6e6e6; }
   .card { background:#1a1d27; border:1px solid #2a2d38; border-radius:10px;
           padding:18px; max-width:520px; }
   .card p { display:flex; justify-content:space-between; margin:8px 0;
@@ -113,7 +161,6 @@ BASE_CSS = """
                         display:none; }
   .autocomplete-list div { padding:8px 10px; cursor:pointer; text-align:left; font-size:14px; }
   .autocomplete-list div:hover, .autocomplete-list div.active-item { background:#2a2d38; }
-  .spinner-note { color:#facc15; font-size:13px; margin-bottom:16px; }
 """
 
 NAV = """
@@ -126,8 +173,6 @@ NAV = """
 </header>
 """
 
-# Small vanilla JS: search-box filter + click-to-sort columns. No build
-# step, no framework - just enough to make a 133-row table usable.
 SCANNER_JS = """
 <script>
 function filterTable() {
@@ -163,9 +208,7 @@ SCANNER_PAGE = """
 <title>Funding Arb Scanner</title>
 <style>{css}</style></head><body>
 {nav}
-<div class="meta">
-  {status_line}
-</div>
+<div class="meta">{status_line}</div>
 <input id="search" placeholder="Filter by coin..." onkeyup="filterTable()">
 <table id="tbl">
 <thead><tr>
@@ -176,9 +219,7 @@ SCANNER_PAGE = """
   <th onclick="sortTable(4,true)">Net %</th>
   <th onclick="sortTable(5,true)">Delta Vol ($)</th>
 </tr></thead>
-<tbody>
-{rows}
-</tbody>
+<tbody>{rows}</tbody>
 </table>
 {js}
 </body></html>
@@ -225,12 +266,10 @@ MULTI_BACKTEST_PAGE = """
 {result_html}
 <div class="note">
   Uses real historical funding rate data from Binance, Bybit, and OKX -
-  their own free, public APIs (weeks/months of real history), not just
-  our own logged data. Pi42 and Delta India are not included here since
-  neither publishes historical funding data anywhere. The coin field
-  suggests common tickers as you type but accepts any ticker - if an
-  unlisted one returns "no matched data", it likely isn't a perpetual on
-  one of the two selected exchanges.
+  their own free, public APIs. Pi42 and Delta India are not included
+  here since neither publishes historical funding data. Want to scan
+  everything at once instead of one coin at a time? See the
+  <a class="coin-link" href="/opportunities">Opportunities</a> page.
 </div>
 <script>
 const ALL_COINS = {coins_json};
@@ -240,9 +279,7 @@ function showCoinSuggestions() {{
   const q = input.value.toUpperCase();
   const matches = ALL_COINS.filter(c => c.startsWith(q)).slice(0, 8);
   if (matches.length === 0) {{ box.style.display = 'none'; return; }}
-  box.innerHTML = matches.map(c =>
-    `<div onclick="selectCoin('${{c}}')">${{c}}</div>`
-  ).join('');
+  box.innerHTML = matches.map(c => `<div onclick="selectCoin('${{c}}')">${{c}}</div>`).join('');
   box.style.display = 'block';
 }}
 function selectCoin(c) {{
@@ -265,19 +302,23 @@ OPPORTUNITIES_PAGE = """
 <style>{css}</style></head><body>
 {nav}
 <div class="note" style="margin-bottom:16px;">
-  Scans every coin below across the Bybit/OKX pair using real historical
-  funding data, ranked by risk-adjusted return - not just a single APY
-  number. <b>Max drawdown</b> is the worst peak-to-trough dip the spread
-  ever had; <b>Sharpe-like</b> is mean gap / gap volatility (higher =
-  steadier edge, near-zero = noisy/unreliable even if the average looks
-  fine). This makes real API calls per coin and can take 1-2 minutes -
-  it does not run automatically.
+  Continuously scans <b>every coin listed on both Bybit and OKX</b>
+  ({universe_size} coins found) using real historical funding data,
+  ranked by risk-adjusted return - not just a single APY number.
+  <b>Max drawdown</b> is the worst peak-to-trough dip the spread ever
+  had; <b>Sharpe-like</b> is mean gap / gap volatility (higher = steadier
+  edge, near-zero = noisy/unreliable even if the average looks fine).
+  Runs automatically every 3 hours in the background - this page just
+  shows the latest cached results, so it loads instantly.
 </div>
+<div class="meta">{status_line}</div>
 <form method="get" action="/opportunities">
-  <div><label>Days</label><input name="days" type="number" value="{days}" style="width:70px"></div>
-  <div><label>Position ($)</label><input name="position" type="number" value="{position}" style="width:110px"></div>
-  <input type="hidden" name="run" value="1">
-  <button type="submit">Run full scan ({coin_count} coins)</button>
+  <div><label>Show top</label>
+    <select name="top">{top_options}</select>
+  </div>
+  <button type="submit">Apply</button>
+  <a href="/opportunities/rescan"><button type="button" class="secondary"
+     onclick="this.form" style="margin-left:4px;">Rescan now</button></a>
 </form>
 {result_html}
 </body></html>
@@ -304,14 +345,10 @@ def render_scanner_page():
         if r["profitable"]:
             cls = "profit"
         elif r["net_pct"] > -0.05:
-            cls = "near"  # close to profitable - worth watching
+            cls = "near"
         else:
             cls = "loss"
-
-        thin_badge = ""
-        if r["delta_volume_usd"] < LOW_LIQUIDITY_USD:
-            thin_badge = '<span class="thin">thin</span>'
-
+        thin_badge = '<span class="thin">thin</span>' if r["delta_volume_usd"] < LOW_LIQUIDITY_USD else ""
         rows_html += (
             f"<tr data-coin='{r['coin'].lower()}'>"
             f"<td><a class='coin-link' href='/backtest?coin={r['coin']}'>{r['coin']}</a>{thin_badge}</td>"
@@ -332,7 +369,6 @@ def render_backtest_page():
     coin = request.args.get("coin", "BTC").upper()
     days = int(request.args.get("days", 7))
     position = float(request.args.get("position", 1000))
-
     result = compute_backtest(coin, days, position)
 
     if not result["enough_data"]:
@@ -341,9 +377,9 @@ def render_backtest_page():
             f'<span>Not enough data yet ({result["data_points"]} point(s))</span></p>'
             f'<div class="note">Backtests only cover time since the scanner started '
             f'logging - there is no historical funding data available before that '
-            f'for Pi42. Come back after this has been running a few days. Or try the '
-            f'<a class="coin-link" href="/multi-backtest">multi-exchange backtest</a> '
-            f'for real historical data on Binance/Bybit/OKX instead.</div></div>'
+            f'for Pi42. Come back after this has been running a few days, or try '
+            f'<a class="coin-link" href="/opportunities">Opportunities</a> for real '
+            f'historical data on Binance/Bybit/OKX instead.</div></div>'
         )
     else:
         result_html = f"""
@@ -361,10 +397,8 @@ def render_backtest_page():
         """
 
     nav = NAV.format(scanner_active="", backtest_active="active", multi_active="", opp_active="")
-    return BACKTEST_PAGE.format(
-        css=BASE_CSS, nav=nav, coin=coin, days=days, position=int(position),
-        result_html=result_html,
-    )
+    return BACKTEST_PAGE.format(css=BASE_CSS, nav=nav, coin=coin, days=days,
+                                 position=int(position), result_html=result_html)
 
 
 def render_multi_backtest_page():
@@ -374,7 +408,6 @@ def render_multi_backtest_page():
     coin = request.args.get("coin", "BTC").upper()
     days = int(request.args.get("days", 30))
     position = float(request.args.get("position", 1000))
-
     result = compute_multi_backtest(exchange_a, exchange_b, coin, days, position)
 
     if not result["enough_data"]:
@@ -383,11 +416,9 @@ def render_multi_backtest_page():
             f'<span>No matched data found</span></p>'
             f'<div class="note">Got {result.get("points_a", 0)} points from '
             f'{exchange_a} and {result.get("points_b", 0)} from {exchange_b}. '
-            f'This coin may not be listed as a perpetual on one of these exchanges, '
-            f'or the symbol format did not match - double check the coin ticker. '
+            f'This coin may not be listed as a perpetual on one of these exchanges. '
             f'Note: Binance has been unreliable from this server (connection '
-            f'timeouts) - try Bybit vs OKX instead if Binance is one of your '
-            f'selections.</div></div>'
+            f'timeouts) - try Bybit vs OKX instead.</div></div>'
         )
     else:
         result_html = f"""
@@ -401,9 +432,7 @@ def render_multi_backtest_page():
           <p><span>P&amp;L on ${result['position_usd']:,.0f}</span><span>${result['position_pnl_usd']:+,.2f}</span></p>
           <p><span>Annualized (APY)</span><span>{result['apy_pct']:+.2f}%</span></p>
           <div class="note">Fee assumption is generic ({GENERIC_ROUND_TRIP_PCT:.2f}% round trip) -
-          not exchange-specific like the Delta/Pi42 numbers elsewhere. Real fees depend
-          on your account tier on each exchange. Assumes one round-trip fee for the
-          whole period, not per re-entry.</div>
+          real fees depend on your account tier on each exchange.</div>
         </div>
         """
 
@@ -424,50 +453,65 @@ def render_multi_backtest_page():
 
 
 def render_opportunities_page():
-    days = int(request.args.get("days", 14))
-    position = float(request.args.get("position", 1000))
-    should_run = request.args.get("run") == "1"
+    top_n = int(request.args.get("top", 10))
 
-    result_html = ""
-    if should_run:
-        results = scan_opportunity_matrix(MULTI_BACKTEST_COINS, days, position)
-        if not results:
-            result_html = '<div class="card"><p><span>Status</span><span>No profitable-enough matches found</span></p></div>'
-        else:
-            rows_html = ""
-            for r in results[:40]:
-                apy_cls = "profit" if r["apy_pct"] > 0 else "loss"
-                rows_html += (
-                    f"<tr>"
-                    f"<td>{r['coin']}</td>"
-                    f"<td>{r['exchange_a']}/{r['exchange_b']}</td>"
-                    f"<td>{r['matched_points']}</td>"
-                    f"<td class='{apy_cls}'>{r['apy_pct']:+.2f}%</td>"
-                    f"<td>{r['max_drawdown_pct']:.3f}%</td>"
-                    f"<td>{r['sharpe_like']:.2f}</td>"
-                    f"<td>{r['total_return_pct']:+.4f}%</td>"
-                    f"</tr>"
-                )
-            result_html = f"""
-            <table>
-            <thead><tr>
-              <th>Coin</th><th>Pair</th><th>Events</th><th>APY</th>
-              <th>Max DD</th><th>Sharpe-like</th><th>Return</th>
-            </tr></thead>
-            <tbody>{rows_html}</tbody>
-            </table>
-            <div class="note">Showing top {min(40, len(results))} of {len(results)} results with
-            enough data, ranked by APY. A high APY with a deep max drawdown or low
-            Sharpe-like value means the edge was choppy/inconsistent even if the
-            headline number looks good - prefer steady results over lucky spikes.</div>
-            """
+    if _opp_running:
+        done, total = _opp_progress
+        status = f'<span style="color:#facc15">Scan in progress: {done}/{total} coins checked...</span>'
+    elif _opp_error:
+        status = f'<span style="color:#f87171">Last scan failed: {_opp_error}</span>'
+    elif _opp_last_run is None:
+        status = "First scan starting up in the background - this can take a few minutes for the full coin universe. Refresh shortly."
     else:
-        result_html = '<div class="note">Click "Run full scan" above to start. This has not been run yet on this page load.</div>'
+        age_min = (datetime.now() - _opp_last_run).total_seconds() / 60
+        status = (
+            f"Last full scan: {_opp_last_run.strftime('%H:%M:%S')} "
+            f"({age_min:.0f} min ago) \u00b7 {len(_opp_results)} results with enough data \u00b7 "
+            f"rescans automatically every {OPPORTUNITY_RESCAN_SECONDS // 3600}h"
+        )
+
+    if _opp_results:
+        rows_html = ""
+        for r in _opp_results[:top_n]:
+            apy_cls = "profit" if r["apy_pct"] > 0 else "loss"
+            rows_html += (
+                f"<tr>"
+                f"<td>{r['coin']}</td>"
+                f"<td>{r['exchange_a']}/{r['exchange_b']}</td>"
+                f"<td>{r['matched_points']}</td>"
+                f"<td class='{apy_cls}'>{r['apy_pct']:+.2f}%</td>"
+                f"<td>{r['max_drawdown_pct']:.3f}%</td>"
+                f"<td>{r['sharpe_like']:.2f}</td>"
+                f"<td>{r['total_return_pct']:+.4f}%</td>"
+                f"</tr>"
+            )
+        result_html = f"""
+        <table>
+        <thead><tr>
+          <th>Coin</th><th>Pair</th><th>Events</th><th>APY</th>
+          <th>Max DD</th><th>Sharpe-like</th><th>Return</th>
+        </tr></thead>
+        <tbody>{rows_html}</tbody>
+        </table>
+        <div class="note">Showing top {min(top_n, len(_opp_results))} of {len(_opp_results)} results,
+        ranked by APY (highest opportunity first). A high APY with a deep max
+        drawdown or low Sharpe-like value means the edge was choppy/inconsistent
+        even if the headline number looks good - prefer steady results over lucky
+        spikes.</div>
+        """
+    else:
+        result_html = '<div class="note">No results yet - the background scan is still running or hasn\'t started.</div>'
+
+    def top_options():
+        return "".join(
+            f'<option value="{n}" {"selected" if n == top_n else ""}>{n}</option>'
+            for n in [10, 25, 50]
+        )
 
     nav = NAV.format(scanner_active="", backtest_active="", multi_active="", opp_active="active")
     return OPPORTUNITIES_PAGE.format(
-        css=BASE_CSS, nav=nav, days=days, position=int(position),
-        coin_count=len(MULTI_BACKTEST_COINS), result_html=result_html,
+        css=BASE_CSS, nav=nav, universe_size=len(_opp_coin_universe),
+        status_line=status, top_options=top_options(), result_html=result_html,
     )
 
 
@@ -491,9 +535,16 @@ def opportunities_route():
     return render_opportunities_page()
 
 
+@app.route("/opportunities/rescan")
+def opportunities_rescan_route():
+    if not _opp_running:
+        threading.Thread(target=run_full_opportunity_scan, daemon=True).start()
+    return redirect("/opportunities")
+
+
 if __name__ == "__main__":
-    thread = threading.Thread(target=background_scanner, daemon=True)
-    thread.start()
+    threading.Thread(target=background_scanner, daemon=True).start()
+    threading.Thread(target=opportunity_background, daemon=True).start()
 
     port = int(os.getenv("SERVER_PORT", 8080))
     print(f"Starting web dashboard on 0.0.0.0:{port}")

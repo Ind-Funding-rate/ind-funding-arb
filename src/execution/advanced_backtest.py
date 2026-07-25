@@ -8,6 +8,19 @@ multi_exchange_backtest.py (Binance/Bybit/OKX public APIs) - it doesn't
 have access to any data source that isn't otherwise free and public. The
 "advanced" part is the analysis (equity curve, drawdown, Sharpe-like
 ratio, cross-pair/cross-coin scanning), not a secret data source.
+
+KNOWN ISSUES FIXED IN THIS VERSION:
+1. Some exchanges list tokenized-stock perpetuals (e.g. IBM, MRVL, AMAT)
+   under the same USDT-margined symbol convention as real crypto. The
+   coin universe is now cross-checked against CoinGecko's free public
+   list of actual cryptocurrencies to filter these out.
+2. The equity curve/max-drawdown calculation previously paid the round-
+   trip fee once, up front, then only ever ADDED positive gap values -
+   which made the curve mathematically incapable of ever dipping, so
+   "max drawdown" always showed 0.000% regardless of what really
+   happened. Fixed by spreading the fee across each event instead, so
+   individual events can be net-negative and the curve genuinely
+   fluctuates.
 """
 import statistics
 import requests
@@ -17,13 +30,36 @@ from src.data.historical_funding import get_history
 GENERIC_ROUND_TRIP_PCT = 4 * 0.05  # 0.20% - see note in multi_exchange_backtest.py
 ALL_EXCHANGES = ["bybit", "okx", "binance"]  # binance often times out from this server
 
+_real_crypto_symbols_cache = None
+
+
+def get_real_crypto_symbols():
+    """Fetches CoinGecko's free public list of actual cryptocurrencies
+    (no API key needed) and returns their ticker symbols in uppercase, so
+    we can filter out tokenized-stock perpetuals that share the same
+    naming convention on some exchanges. Cached after first call since
+    this list rarely changes and CoinGecko's keyless endpoint is rate
+    limited."""
+    global _real_crypto_symbols_cache
+    if _real_crypto_symbols_cache is not None:
+        return _real_crypto_symbols_cache
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/coins/list", timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        _real_crypto_symbols_cache = {c["symbol"].upper() for c in data}
+    except Exception as e:
+        print(f"  [!] Failed to fetch CoinGecko coin list: {e}")
+        _real_crypto_symbols_cache = set()  # empty set = filter becomes a no-op, fails open
+    return _real_crypto_symbols_cache
+
 
 def get_full_common_coin_universe():
     """Dynamically fetches EVERY perpetual symbol actually listed on both
-    Bybit and OKX right now (public, no API key), and returns the coins
-    common to both. This can be a few hundred coins - the caller decides
-    how many to actually scan/show, this just gives the true full list
-    rather than a hand-picked subset."""
+    Bybit and OKX right now (public, no API key), intersects them, and
+    then filters out anything that isn't a real cryptocurrency according
+    to CoinGecko's public list (removes tokenized-stock perpetuals like
+    IBM/MRVL/AMAT that share the same USDT-margined naming convention)."""
     bybit_coins = set()
     try:
         r = requests.get(
@@ -50,17 +86,33 @@ def get_full_common_coin_universe():
     except Exception as e:
         print(f"  [!] Failed to fetch OKX instrument list: {e}")
 
-    return sorted(bybit_coins & okx_coins)
+    common = bybit_coins & okx_coins
+    real_crypto = get_real_crypto_symbols()
+    if real_crypto:
+        filtered = sorted(c for c in common if c in real_crypto)
+        removed = sorted(common - set(filtered))
+        if removed:
+            print(f"  [info] Filtered out {len(removed)} non-crypto symbols "
+                  f"(likely tokenized stocks/ETFs): {removed[:20]}"
+                  f"{'...' if len(removed) > 20 else ''}")
+        return filtered
+    # If the CoinGecko check itself failed, fail open rather than return
+    # nothing - just note that the list wasn't filtered.
+    print("  [warn] Could not verify against CoinGecko - coin list is NOT filtered for non-crypto symbols")
+    return sorted(common)
 
 
 def compute_advanced_backtest(exchange_a: str, exchange_b: str, coin: str,
                                 days: int, position_usd: float,
                                 fee_override_pct: float = None) -> dict:
     """Same core simulation as compute_multi_backtest(), extended with:
-    - an equity curve (cumulative return over time, event by event)
+    - an equity curve (cumulative return over time, event by event) that
+      can genuinely fluctuate, because the round-trip fee is spread
+      across each event instead of paid once up front
     - max drawdown of that curve (worst peak-to-trough dip)
-    - a Sharpe-like ratio: mean per-event return / std dev of per-event
-      return, as a rough measure of how consistent vs choppy the edge was
+    - a Sharpe-like ratio: mean per-event NET return / std dev of
+      per-event NET return, as a rough measure of how consistent vs
+      choppy the edge was
     - gap distribution stats (min/median/max), so a single lucky spike
       doesn't get mistaken for a reliable edge
     """
@@ -95,14 +147,22 @@ def compute_advanced_backtest(exchange_a: str, exchange_b: str, coin: str,
                 "matched_points": len(matched)}
 
     event_gaps_pct = [abs(ra - rb) * 100 for _, ra, rb in matched]
+
+    # Fee is spread across events (not paid once up front) so the equity
+    # curve can genuinely go up AND down - this is what makes max
+    # drawdown and the Sharpe-like ratio meaningful instead of
+    # structurally guaranteed to always look perfect.
+    per_event_fee_pct = round_trip_pct / len(event_gaps_pct)
+    net_events_pct = [g - per_event_fee_pct for g in event_gaps_pct]
+
     equity_curve = []
-    running_total = -round_trip_pct
-    for gap in event_gaps_pct:
-        running_total += gap
+    running_total = 0.0
+    for net in net_events_pct:
+        running_total += net
         equity_curve.append(running_total)
 
     total_return_pct = equity_curve[-1]
-    profitable_events = sum(1 for g in event_gaps_pct if g > round_trip_pct / len(event_gaps_pct))
+    profitable_events = sum(1 for n in net_events_pct if n > 0)
 
     peak = equity_curve[0]
     max_drawdown = 0.0
@@ -110,8 +170,8 @@ def compute_advanced_backtest(exchange_a: str, exchange_b: str, coin: str,
         peak = max(peak, v)
         max_drawdown = min(max_drawdown, v - peak)
 
-    if len(event_gaps_pct) > 1 and statistics.pstdev(event_gaps_pct) > 0:
-        sharpe_like = statistics.mean(event_gaps_pct) / statistics.pstdev(event_gaps_pct)
+    if len(net_events_pct) > 1 and statistics.pstdev(net_events_pct) > 0:
+        sharpe_like = statistics.mean(net_events_pct) / statistics.pstdev(net_events_pct)
     else:
         sharpe_like = 0.0
 
@@ -131,6 +191,8 @@ def compute_advanced_backtest(exchange_a: str, exchange_b: str, coin: str,
         "total_return_pct": round(total_return_pct, 4),
         "position_pnl_usd": round(position_pnl_usd, 2),
         "apy_pct": round(apy_pct, 2),
+        "profitable_events": profitable_events,
+        "pct_events_profitable": round(profitable_events / len(matched) * 100, 1),
         "max_drawdown_pct": round(max_drawdown, 4),
         "sharpe_like": round(sharpe_like, 3),
         "gap_min_pct": round(sorted_gaps[0], 5),

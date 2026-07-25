@@ -1,22 +1,15 @@
 """
-Minimal web dashboard - 4 pages: live scanner, Delta/Pi42 backtest (our
-own logged data), multi-exchange historical backtest, and an automated
-opportunity matrix scanner across ALL available coins x exchange pairs.
+Minimal web dashboard - 6 pages: live scanner, Indian exchanges overview,
+Indian opportunities, Delta/Pi42 backtest (our own logged data),
+multi-exchange historical backtest, and an automated opportunity matrix
+scanner across ALL available coins x exchange pairs.
 
-Runs THREE background loops, decoupled from each other (this is the
-speed fix - see src/data/ingest_funding.py and
-src/data/funding_history_store.py for the full explanation):
-
+Runs THREE background loops, decoupled from each other:
 1. Live full-market scanner (Delta vs Pi42, 133 coins, every ~90s)
 2. INGESTION: pulls historical data from Bybit/OKX into our own local
-   database, in parallel (ThreadPoolExecutor), every 30 min. This is the
-   only part that makes slow network calls.
+   database, in parallel (ThreadPoolExecutor), every 30 min.
 3. RANKING: reads from that local database (fast, no network) and
-   recomputes the ranked opportunity list every 5 min. Scales fine as
-   more exchanges/coins are added later since it's just local reads.
-
-The /opportunities page always shows the latest cached ranking result
-instantly - it never waits on live exchange calls.
+   recomputes the ranked opportunity list every 5 min.
 
 Binds to whatever port HidenCloud/Pterodactyl assigns via the SERVER_PORT
 env var (falls back to 8080 if not set, for local testing).
@@ -57,10 +50,133 @@ MULTI_BACKTEST_COINS = [
     "FIL", "HBAR", "ICP", "AAVE", "MKR", "LDO", "GALA", "SAND",
 ]
 
-INGEST_INTERVAL_SECONDS = 30 * 60   # slow, real network calls - every 30 min
-RANK_INTERVAL_SECONDS = 5 * 60      # fast, local reads only - every 5 min
-BACKTEST_DAYS_DEFAULT = 14
-POSITION_DEFAULT = 1000
+INGEST_INTERVAL_SECONDS = 30 * 60
+RANK_INTERVAL_SECONDS   = 5 * 60
+BACKTEST_DAYS_DEFAULT   = 14
+POSITION_DEFAULT        = 1000
+
+# ── INDIAN EXCHANGE REGISTRY ──────────────────────────────────
+# Static data about every Indian crypto exchange, used on the
+# /indian-exchanges overview page.
+INDIAN_EXCHANGE_REGISTRY = [
+    {
+        "name": "Delta Exchange India",
+        "type": "Derivatives",
+        "inr_deposit": "UPI · IMPS · NEFT",
+        "futures": True,
+        "pairs": "50+",
+        "funding_interval": "8 hrs",
+        "api_status": "full",
+        "integration": "live",
+        "api_docs": "https://docs.delta.exchange",
+        "fiu_registered": True,
+        "notes": "FIU-registered. INR-settled USD pairs. Primary short leg.",
+    },
+    {
+        "name": "Pi42",
+        "type": "Derivatives",
+        "inr_deposit": "UPI",
+        "futures": True,
+        "pairs": "700+",
+        "funding_interval": "4\u20138 hrs",
+        "api_status": "full",
+        "integration": "live",
+        "api_docs": "https://docs.pi42.com",
+        "fiu_registered": True,
+        "notes": "FIU-registered. INR-native margin. Claims no TDS/VDA tax. Primary long leg.",
+    },
+    {
+        "name": "CoinDCX",
+        "type": "Spot + Futures",
+        "inr_deposit": "UPI · Bank Transfer",
+        "futures": True,
+        "pairs": "20+",
+        "funding_interval": "8 hrs",
+        "api_status": "partial",
+        "integration": "coming_soon",
+        "api_docs": "https://docs.coindcx.com",
+        "fiu_registered": True,
+        "notes": "Has futures but funding rate not available in public REST API.",
+    },
+    {
+        "name": "Shark Exchange",
+        "type": "Derivatives",
+        "inr_deposit": "UPI",
+        "futures": True,
+        "pairs": "10+",
+        "funding_interval": "8 hrs",
+        "api_status": "none",
+        "integration": "no_api",
+        "api_docs": None,
+        "fiu_registered": True,
+        "notes": "No public API documentation found. Cannot integrate without docs.",
+    },
+    {
+        "name": "CoinSwitch PRO",
+        "type": "Aggregator",
+        "inr_deposit": "UPI",
+        "futures": True,
+        "pairs": "20+",
+        "funding_interval": "8 hrs",
+        "api_status": "partial",
+        "integration": "not_suitable",
+        "api_docs": "https://developers.coinswitch.co",
+        "fiu_registered": True,
+        "notes": "Aggregator \u2014 routes to partner exchanges. Extra fee layer kills arbitrage margin.",
+    },
+    {
+        "name": "WazirX",
+        "type": "Spot Only",
+        "inr_deposit": "UPI · Bank",
+        "futures": False,
+        "pairs": "500+ spot",
+        "funding_interval": "N/A",
+        "api_status": "partial",
+        "integration": "no_futures",
+        "api_docs": "https://docs.wazirx.com",
+        "fiu_registered": True,
+        "notes": "Spot trading only. No perpetual futures available.",
+    },
+    {
+        "name": "Zebpay",
+        "type": "Spot Only",
+        "inr_deposit": "UPI · Bank",
+        "futures": False,
+        "pairs": "50+ spot",
+        "funding_interval": "N/A",
+        "api_status": "partial",
+        "integration": "no_futures",
+        "api_docs": "https://developers.zebpay.com",
+        "fiu_registered": True,
+        "notes": "Spot trading only. No perpetual futures available.",
+    },
+    {
+        "name": "Mudrex",
+        "type": "Spot + Bots",
+        "inr_deposit": "UPI",
+        "futures": False,
+        "pairs": "100+ spot",
+        "funding_interval": "N/A",
+        "api_status": "none",
+        "integration": "no_futures",
+        "api_docs": None,
+        "fiu_registered": True,
+        "notes": "Crypto bot/investment platform. No perpetual futures for arb.",
+    },
+    {
+        "name": "Coinbase India",
+        "type": "Spot + Futures",
+        "inr_deposit": "IMPS (since June 2026)",
+        "futures": True,
+        "pairs": "20+",
+        "funding_interval": "8 hrs",
+        "api_status": "partial",
+        "integration": "coming_soon",
+        "api_docs": "https://docs.cdp.coinbase.com",
+        "fiu_registered": True,
+        "notes": "Launched India June 2026. Too new \u2014 monitoring for API stability.",
+    },
+]
 
 # ── SHARED STATE: live scanner (Delta vs Pi42) ─────────────────
 _latest_rows = []
@@ -96,9 +212,6 @@ _opp_error = None
 
 
 def ingestion_background():
-    """The slow part - real network calls to Bybit/OKX, parallelized.
-    Runs independently of the ranking loop below, so the page never
-    waits on this."""
     global _opp_coin_universe, _ingest_running, _ingest_progress, _ingest_last_run, _ingest_error
     init_store()
     while True:
@@ -126,9 +239,6 @@ def ingestion_background():
 
 
 def run_ranking_pass():
-    """The fast part - reads from the local store only. Safe to call
-    on demand (e.g. the 'Rescan now' button) since it makes no network
-    calls itself."""
     global _opp_results, _opp_last_run, _opp_running, _opp_error
     if _opp_running or not _opp_coin_universe:
         return
@@ -198,15 +308,33 @@ BASE_CSS = """
                         display:none; }
   .autocomplete-list div { padding:8px 10px; cursor:pointer; text-align:left; font-size:14px; }
   .autocomplete-list div:hover, .autocomplete-list div.active-item { background:#2a2d38; }
+  .stat-cards { display:flex; gap:14px; flex-wrap:wrap; margin-bottom:24px; }
+  .stat-card { background:#1a1d27; border:1px solid #2a2d38; border-radius:10px;
+               padding:16px 20px; min-width:180px; }
+  .stat-label { font-size:11px; color:#8b8fa3; font-weight:600; letter-spacing:.06em; margin-bottom:6px; }
+  .stat-value { font-size:26px; font-weight:700; }
+  .stat-sub { font-size:11px; color:#8b8fa3; margin-top:4px; }
+  .badge-live { display:inline-block; background:#14532d; color:#4ade80;
+                font-size:11px; font-weight:700; padding:2px 8px; border-radius:4px; }
+  .badge-soon { display:inline-block; background:#422006; color:#facc15;
+                font-size:11px; font-weight:700; padding:2px 8px; border-radius:4px; }
+  .badge-no { display:inline-block; background:#2d1515; color:#f87171;
+              font-size:11px; padding:2px 8px; border-radius:4px; }
+  .badge-na { display:inline-block; background:#1f222c; color:#8b8fa3;
+              font-size:11px; padding:2px 8px; border-radius:4px; }
+  .section-title { font-size:13px; color:#8b8fa3; font-weight:600;
+                   letter-spacing:.08em; margin:28px 0 12px; }
 """
 
 NAV = """
 <header>
   <h1>Funding Arb</h1>
   <a href="/" class="{scanner_active}">Scanner</a>
+  <a href="/indian-exchanges" class="{indian_active}">\U0001f1ee\U0001f1f3 Indian Exchanges</a>
+  <a href="/indian-opportunities" class="{indiaopp_active}">\U0001f1ee\U0001f1f3 Opportunities</a>
   <a href="/backtest" class="{backtest_active}">Backtest (ours)</a>
   <a href="/multi-backtest" class="{multi_active}">Backtest (multi-exchange)</a>
-  <a href="/opportunities" class="{opp_active}">Opportunities</a>
+  <a href="/opportunities" class="{opp_active}">Opportunities (global)</a>
 </header>
 """
 
@@ -306,7 +434,7 @@ MULTI_BACKTEST_PAGE = """
   their own free, public APIs. Pi42 and Delta India are not included
   here since neither publishes historical funding data. Want to scan
   everything at once instead of one coin at a time? See the
-  <a class="coin-link" href="/opportunities">Opportunities</a> page.
+  <a class="coin-link" href="/opportunities">Opportunities (global)</a> page.
 </div>
 <script>
 const ALL_COINS = {coins_json};
@@ -316,7 +444,7 @@ function showCoinSuggestions() {{
   const q = input.value.toUpperCase();
   const matches = ALL_COINS.filter(c => c.startsWith(q)).slice(0, 8);
   if (matches.length === 0) {{ box.style.display = 'none'; return; }}
-  box.innerHTML = matches.map(c => `<div onclick="selectCoin('${{c}}')">${{c}}</div>`).join('');
+  box.innerHTML = matches.map(c => `<div onclick="selectCoin('${{c}}')">\${{c}}</div>`).join('');
   box.style.display = 'block';
 }}
 function selectCoin(c) {{
@@ -361,6 +489,132 @@ OPPORTUNITIES_PAGE = """
 </body></html>
 """
 
+# ── NEW: Indian Exchanges page template ───────────────────────
+INDIAN_EXCHANGES_PAGE = """
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Indian Exchanges \u2014 Funding Arb</title>
+<style>{css}</style></head><body>
+{nav}
+
+<h2 style="font-size:18px;margin:0 0 6px;">\U0001f1ee\U0001f1f3 Indian Crypto Exchanges</h2>
+<p class="meta">All Indian exchanges evaluated for funding rate arbitrage suitability. Live rates updated: {scan_time}</p>
+
+<div class="section-title">LIVE BTC FUNDING RATES \u2014 INTEGRATED EXCHANGES</div>
+<div class="stat-cards">
+  <div class="stat-card">
+    <div class="stat-label">DELTA EXCHANGE INDIA \u00b7 BTCUSD</div>
+    <div class="stat-value" style="color:#4ade80">{delta_btc_rate}</div>
+    <div class="stat-sub">per 8-hour funding period</div>
+    <div style="margin-top:10px"><span class="badge-live">\U0001f7e2 LIVE \u2014 Integrated</span></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">PI42 \u00b7 BTCUSDT</div>
+    <div class="stat-value" style="color:#4ade80">{pi42_btc_rate}</div>
+    <div class="stat-sub">per funding period (4\u20138 hrs)</div>
+    <div style="margin-top:10px"><span class="badge-live">\U0001f7e2 LIVE \u2014 Integrated</span></div>
+  </div>
+  <div class="stat-card" style="opacity:0.55">
+    <div class="stat-label">COINDCX \u00b7 BTCUSDT</div>
+    <div class="stat-value" style="font-size:16px;color:#8b8fa3">No Public API</div>
+    <div class="stat-sub">Futures exist but funding rate not exposed</div>
+    <div style="margin-top:10px"><span class="badge-soon">\U0001f504 Coming Soon</span></div>
+  </div>
+  <div class="stat-card" style="opacity:0.55">
+    <div class="stat-label">SHARK EXCHANGE</div>
+    <div class="stat-value" style="font-size:16px;color:#8b8fa3">No API Docs</div>
+    <div class="stat-sub">No public API documentation found</div>
+    <div style="margin-top:10px"><span class="badge-no">\u274c No API</span></div>
+  </div>
+</div>
+
+<div class="section-title">ALL INDIAN EXCHANGES \u2014 SUITABILITY MATRIX</div>
+<div style="overflow-x:auto">
+<table>
+<thead><tr>
+  <th>Exchange</th>
+  <th>Type</th>
+  <th>INR Deposit</th>
+  <th style="text-align:center">Perp Futures</th>
+  <th>Pairs</th>
+  <th>Funding Interval</th>
+  <th>API</th>
+  <th style="text-align:center">FIU Reg.</th>
+  <th>Status</th>
+  <th>Notes</th>
+</tr></thead>
+<tbody>{exchange_rows}</tbody>
+</table>
+</div>
+
+<div class="note" style="margin-top:24px;max-width:700px">
+  <b>Why only Delta + Pi42 are fully integrated:</b>
+  Funding rate arbitrage requires perpetual futures \u2713, a live public API for funding rates \u2713,
+  and reliable WebSocket data \u2713.
+  CoinDCX has futures but their public REST API does not expose the current funding rate.
+  Shark Exchange has no published API documentation.
+  WazirX, Zebpay, and Mudrex are spot-only platforms.
+  CoinSwitch PRO is an aggregation platform that routes orders to partner exchanges and adds
+  an extra fee layer that eliminates the arbitrage margin.
+  Coinbase India launched in June 2026 and is too new to depend on.
+  We continuously monitor new exchanges and will integrate them the moment they meet all criteria.
+</div>
+</body></html>
+"""
+
+# ── NEW: Indian Opportunities page template ───────────────────
+INDIAN_OPPORTUNITIES_PAGE = """
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Indian Opportunities \u2014 Funding Arb</title>
+<style>{css}
+auto { animation: pulse 2s infinite; }
+@keyframes pulse {{ 0%,100% {{ opacity:1; }} 50% {{ opacity:.5; }} }}
+</style></head><body>
+{nav}
+
+<h2 style="font-size:18px;margin:0 0 6px;">\U0001f1ee\U0001f1f3 Indian Exchange Opportunities</h2>
+<p class="meta">
+  Live funding rate arbitrage between Delta Exchange India and Pi42.
+  Last scan: {scan_time} \u00b7 {total_coins} coins monitored \u00b7 Fee floor: {fee_floor}% round-trip (taker + 18% GST)
+</p>
+
+<div class="stat-cards">
+  <div class="stat-card" style="border-color:{profitable_border}">
+    <div class="stat-label">PROFITABLE NOW</div>
+    <div class="stat-value" style="color:{profitable_color}">{profitable_count}</div>
+    <div class="stat-sub">coins above fee threshold</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">BEST COIN</div>
+    <div class="stat-value" style="color:#4ade80">{best_coin}</div>
+    <div class="stat-sub">net {best_net}% per funding period</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">NEAR MISS</div>
+    <div class="stat-value" style="color:#facc15">{near_count}</div>
+    <div class="stat-sub">coins within 0.1% of profitability</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">TOTAL SCANNED</div>
+    <div class="stat-value">{total_coins}</div>
+    <div class="stat-sub">coins on both exchanges</div>
+  </div>
+</div>
+
+{profitable_section}
+{near_section}
+
+<div class="note" style="margin-top:24px;max-width:680px">
+  <b>How this works:</b> When Delta funding &gt; Pi42 funding: go <b>Short on Delta</b>
+  (you receive the high funding rate) + <b>Long on Pi42</b> (you pay the low funding rate).
+  The net profit is the gap minus round-trip fees. Direction reverses if Pi42 funding is higher.
+  Page auto-refreshes every 90 seconds (same as the scan cycle).
+</div>
+<script>setTimeout(()=>location.reload(), 92000);</script>
+</body></html>
+"""
+
 
 def render_scanner_page():
     if _scan_error:
@@ -398,7 +652,8 @@ def render_scanner_page():
     if not rows_html:
         rows_html = "<tr><td colspan='6'>No data yet.</td></tr>"
 
-    nav = NAV.format(scanner_active="active", backtest_active="", multi_active="", opp_active="")
+    nav = NAV.format(scanner_active="active", backtest_active="", multi_active="",
+                     opp_active="", indian_active="", indiaopp_active="")
     return SCANNER_PAGE.format(css=BASE_CSS, nav=nav, status_line=status, rows=rows_html, js=SCANNER_JS)
 
 
@@ -415,7 +670,7 @@ def render_backtest_page():
             f'<div class="note">Backtests only cover time since the scanner started '
             f'logging - there is no historical funding data available before that '
             f'for Pi42. Come back after this has been running a few days, or try '
-            f'<a class="coin-link" href="/opportunities">Opportunities</a> for real '
+            f'<a class="coin-link" href="/opportunities">Opportunities (global)</a> for real '
             f'historical data on Binance/Bybit/OKX instead.</div></div>'
         )
     else:
@@ -433,7 +688,8 @@ def render_backtest_page():
         </div>
         """
 
-    nav = NAV.format(scanner_active="", backtest_active="active", multi_active="", opp_active="")
+    nav = NAV.format(scanner_active="", backtest_active="active", multi_active="",
+                     opp_active="", indian_active="", indiaopp_active="")
     return BACKTEST_PAGE.format(css=BASE_CSS, nav=nav, coin=coin, days=days,
                                  position=int(position), result_html=result_html)
 
@@ -479,7 +735,8 @@ def render_multi_backtest_page():
             for e in exchanges
         )
 
-    nav = NAV.format(scanner_active="", backtest_active="", multi_active="active", opp_active="")
+    nav = NAV.format(scanner_active="", backtest_active="", multi_active="active",
+                     opp_active="", indian_active="", indiaopp_active="")
     return MULTI_BACKTEST_PAGE.format(
         css=BASE_CSS, nav=nav,
         exchange_a_options=exchange_options(exchange_a),
@@ -559,7 +816,8 @@ def render_opportunities_page():
             for n in [10, 25, 50]
         )
 
-    nav = NAV.format(scanner_active="", backtest_active="", multi_active="", opp_active="active")
+    nav = NAV.format(scanner_active="", backtest_active="", multi_active="",
+                     opp_active="active", indian_active="", indiaopp_active="")
     return OPPORTUNITIES_PAGE.format(
         css=BASE_CSS, nav=nav, universe_size=len(_opp_coin_universe),
         ingest_status=ingest_status, rank_status=rank_status,
@@ -567,9 +825,196 @@ def render_opportunities_page():
     )
 
 
+# ── NEW: Indian Exchanges page render ─────────────────────────
+def render_indian_exchanges_page():
+    # Pull live BTC rates from the existing scanner data (no extra API calls)
+    btc_row = next((r for r in _latest_rows if r["coin"] == "BTC"), None)
+
+    if btc_row:
+        delta_btc_rate = f"{btc_row['delta_funding_pct']:.6f}%"
+        pi42_btc_rate  = f"{btc_row['pi42_funding_pct']:.6f}%"
+    else:
+        delta_btc_rate = "Loading..."
+        pi42_btc_rate  = "Loading..."
+
+    scan_time = _last_scan_time.strftime("%H:%M:%S") if _last_scan_time else "Starting..."
+
+    # Build exchange matrix rows
+    api_map = {
+        "full":    '<span class="badge-live">\u2705 Full</span>',
+        "partial": '<span class="badge-soon">\u26a0\ufe0f Partial</span>',
+        "none":    '<span class="badge-no">\u274c None</span>',
+    }
+    int_map = {
+        "live":          '<span class="badge-live">\U0001f7e2 Live</span>',
+        "coming_soon":   '<span class="badge-soon">\U0001f504 Coming Soon</span>',
+        "no_api":        '<span class="badge-no">\u274c No API Docs</span>',
+        "not_suitable":  '<span class="badge-no">\u274c Not Suitable</span>',
+        "no_futures":    '<span class="badge-na">\u26aa Spot Only</span>',
+    }
+
+    rows_html = ""
+    for exc in INDIAN_EXCHANGE_REGISTRY:
+        docs = (f'<a href="{exc["api_docs"]}" target="_blank" '
+                f'style="color:#8b8fa3;font-size:11px">{exc["name"]} docs \u2197</a>'
+                if exc["api_docs"] else exc["name"])
+        futures_str = "\u2705" if exc["futures"] else "\u274c"
+        fiu_str     = "\u2705" if exc["fiu_registered"] else "\u274c"
+        rows_html += (
+            f"<tr>"
+            f"<td>{docs}</td>"
+            f"<td>{exc['type']}</td>"
+            f"<td>{exc['inr_deposit']}</td>"
+            f"<td style='text-align:center'>{futures_str}</td>"
+            f"<td>{exc.get('pairs','\u2014')}</td>"
+            f"<td>{exc.get('funding_interval','N/A')}</td>"
+            f"<td>{api_map.get(exc['api_status'],'')}</td>"
+            f"<td style='text-align:center'>{fiu_str}</td>"
+            f"<td>{int_map.get(exc['integration'],'')}</td>"
+            f"<td style='font-size:12px;color:#8b8fa3'>{exc['notes']}</td>"
+            f"</tr>"
+        )
+
+    nav = NAV.format(scanner_active="", backtest_active="", multi_active="",
+                     opp_active="", indian_active="active", indiaopp_active="")
+    return INDIAN_EXCHANGES_PAGE.format(
+        css=BASE_CSS, nav=nav,
+        delta_btc_rate=delta_btc_rate,
+        pi42_btc_rate=pi42_btc_rate,
+        scan_time=scan_time,
+        exchange_rows=rows_html,
+    )
+
+
+# ── NEW: Indian Opportunities page render ─────────────────────
+def render_indian_opportunities_page():
+    scan_time   = _last_scan_time.strftime("%H:%M:%S") if _last_scan_time else "Starting..."
+    total_coins = len(_latest_rows)
+    fee_floor   = f"{ROUND_TRIP * 100:.4f}"
+
+    profitable = [r for r in _latest_rows if r["profitable"]]
+    near       = [r for r in _latest_rows if not r["profitable"] and r["net_pct"] > -0.10]
+
+    # Summary stats
+    profitable_count  = len(profitable)
+    near_count        = len(near)
+    profitable_color  = "#4ade80" if profitable_count > 0 else "#8b8fa3"
+    profitable_border = "#166534" if profitable_count > 0 else "#2a2d38"
+
+    if profitable:
+        best = max(profitable, key=lambda r: r["net_pct"])
+        best_coin = best["coin"]
+        best_net  = f"{best['net_pct']:+.5f}"
+    else:
+        best_coin = "None"
+        best_net  = "0.00000"
+
+    # Profitable table
+    if profitable:
+        p_rows = ""
+        for r in sorted(profitable, key=lambda r: r["net_pct"], reverse=True):
+            direction = (
+                "Short Delta \u00b7 Long Pi42"
+                if r["delta_funding_pct"] >= r["pi42_funding_pct"]
+                else "Short Pi42 \u00b7 Long Delta"
+            )
+            thin = '<span class="thin">thin</span>' if r["delta_volume_usd"] < LOW_LIQUIDITY_USD else ""
+            apy_est = r["net_pct"] * 3 * 365  # 3 funding periods per day
+            p_rows += (
+                f"<tr>"
+                f"<td><a class='coin-link' href='/backtest?coin={r['coin']}'>{r['coin']}</a>{thin}</td>"
+                f"<td>{r['delta_funding_pct']:.5f}%</td>"
+                f"<td>{r['pi42_funding_pct']:.5f}%</td>"
+                f"<td>{r['gap_pct']:.5f}%</td>"
+                f"<td class='profit'>{r['net_pct']:+.5f}%</td>"
+                f"<td class='profit'>{apy_est:+.1f}%</td>"
+                f"<td style='font-size:12px'>{direction}</td>"
+                f"<td>{r['delta_volume_usd']:,.0f}</td>"
+                f"</tr>"
+            )
+        profitable_section = f"""
+        <div class="section-title">\U0001f7e2 PROFITABLE OPPORTUNITIES ({profitable_count})</div>
+        <table>
+        <thead><tr>
+          <th>Coin</th><th>Delta %</th><th>Pi42 %</th><th>Gap %</th>
+          <th>Net %</th><th>Est. APY</th><th>Direction</th><th>Delta Vol ($)</th>
+        </tr></thead>
+        <tbody>{p_rows}</tbody>
+        </table>
+        """
+    else:
+        profitable_section = (
+            '<div class="section-title">\U0001f7e2 PROFITABLE OPPORTUNITIES</div>'
+            '<div class="note" style="background:#1a1d27;border:1px solid #2a2d38;'
+            'border-radius:8px;padding:16px;margin-bottom:20px;">'
+            'No profitable opportunities right now. Fee floor is '
+            f'{fee_floor}%. Near misses are shown below.</div>'
+        )
+
+    # Near misses table
+    if near:
+        n_rows = ""
+        for r in sorted(near, key=lambda r: r["net_pct"], reverse=True)[:15]:
+            direction = (
+                "Short Delta \u00b7 Long Pi42"
+                if r["delta_funding_pct"] >= r["pi42_funding_pct"]
+                else "Short Pi42 \u00b7 Long Delta"
+            )
+            n_rows += (
+                f"<tr>"
+                f"<td><a class='coin-link' href='/backtest?coin={r['coin']}'>{r['coin']}</a></td>"
+                f"<td>{r['delta_funding_pct']:.5f}%</td>"
+                f"<td>{r['pi42_funding_pct']:.5f}%</td>"
+                f"<td>{r['gap_pct']:.5f}%</td>"
+                f"<td class='near'>{r['net_pct']:+.5f}%</td>"
+                f"<td style='font-size:12px'>{direction}</td>"
+                f"</tr>"
+            )
+        near_section = f"""
+        <div class="section-title" style="margin-top:28px">\U0001f7e1 NEAR MISSES \u2014 within 0.1% of profitability ({near_count})</div>
+        <table>
+        <thead><tr>
+          <th>Coin</th><th>Delta %</th><th>Pi42 %</th><th>Gap %</th>
+          <th>Net %</th><th>Direction</th>
+        </tr></thead>
+        <tbody>{n_rows}</tbody>
+        </table>
+        """
+    else:
+        near_section = ""
+
+    nav = NAV.format(scanner_active="", backtest_active="", multi_active="",
+                     opp_active="", indian_active="", indiaopp_active="active")
+    return INDIAN_OPPORTUNITIES_PAGE.format(
+        css=BASE_CSS, nav=nav,
+        scan_time=scan_time,
+        total_coins=total_coins,
+        fee_floor=fee_floor,
+        profitable_count=profitable_count,
+        profitable_color=profitable_color,
+        profitable_border=profitable_border,
+        best_coin=best_coin,
+        best_net=best_net,
+        near_count=near_count,
+        profitable_section=profitable_section,
+        near_section=near_section,
+    )
+
+
+# ── ROUTES ───────────────────────────────────────────────────
 @app.route("/")
 def scanner_route():
     return render_scanner_page()
+
+
+@app.route("/indian-exchanges")
+def indian_exchanges_route():
+    return render_indian_exchanges_page()
+
+
+@app.route("/indian-opportunities")
+def indian_opportunities_route():
+    return render_indian_opportunities_page()
 
 
 @app.route("/backtest")
@@ -589,9 +1034,6 @@ def opportunities_route():
 
 @app.route("/opportunities/rescan")
 def opportunities_rescan_route():
-    # Only re-runs the fast, local RANKING pass, not ingestion - ingestion
-    # keeps running on its own slower schedule regardless. This is why
-    # "Re-rank now" returns almost instantly instead of taking minutes.
     if not _opp_running:
         threading.Thread(target=run_ranking_pass, daemon=True).start()
     return redirect("/opportunities")

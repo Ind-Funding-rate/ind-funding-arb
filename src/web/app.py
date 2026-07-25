@@ -3,16 +3,20 @@ Minimal web dashboard - 4 pages: live scanner, Delta/Pi42 backtest (our
 own logged data), multi-exchange historical backtest, and an automated
 opportunity matrix scanner across ALL available coins x exchange pairs.
 
-Runs two background threads continuously:
-1. The live full-market scanner (Delta vs Pi42, 133 coins, every ~90s)
-2. The historical opportunity matrix scanner (ALL coins common to Bybit
-   and OKX - dynamically fetched, can be a few hundred - every 3 hours,
-   since it makes many real API calls and funding data only updates
-   every 8h anyway)
+Runs THREE background loops, decoupled from each other (this is the
+speed fix - see src/data/ingest_funding.py and
+src/data/funding_history_store.py for the full explanation):
 
-Both keep their latest results in memory and are served as plain
-server-rendered HTML - no JS framework, no build step, loads fast on a
-free-tier server.
+1. Live full-market scanner (Delta vs Pi42, 133 coins, every ~90s)
+2. INGESTION: pulls historical data from Bybit/OKX into our own local
+   database, in parallel (ThreadPoolExecutor), every 30 min. This is the
+   only part that makes slow network calls.
+3. RANKING: reads from that local database (fast, no network) and
+   recomputes the ranked opportunity list every 5 min. Scales fine as
+   more exchanges/coins are added later since it's just local reads.
+
+The /opportunities page always shows the latest cached ranking result
+instantly - it never waits on live exchange calls.
 
 Binds to whatever port HidenCloud/Pterodactyl assigns via the SERVER_PORT
 env var (falls back to 8080 if not set, for local testing).
@@ -39,6 +43,8 @@ from src.execution.advanced_backtest import (
     compute_advanced_backtest, find_best_pair, scan_opportunity_matrix,
     get_full_common_coin_universe,
 )
+from src.data.ingest_funding import ingest_all
+from src.data.funding_history_store import init_store, get_store_stats
 
 app = Flask(__name__)
 
@@ -51,7 +57,10 @@ MULTI_BACKTEST_COINS = [
     "FIL", "HBAR", "ICP", "AAVE", "MKR", "LDO", "GALA", "SAND",
 ]
 
-OPPORTUNITY_RESCAN_SECONDS = 3 * 60 * 60  # 3 hours between full scans
+INGEST_INTERVAL_SECONDS = 30 * 60   # slow, real network calls - every 30 min
+RANK_INTERVAL_SECONDS = 5 * 60      # fast, local reads only - every 5 min
+BACKTEST_DAYS_DEFAULT = 14
+POSITION_DEFAULT = 1000
 
 # ── SHARED STATE: live scanner (Delta vs Pi42) ─────────────────
 _latest_rows = []
@@ -72,48 +81,76 @@ def background_scanner():
         time.sleep(CYCLE_SECONDS)
 
 
-# ── SHARED STATE: opportunity matrix (ALL coins, Bybit/OKX historical) ─
+# ── SHARED STATE: opportunity matrix (ingestion + ranking, decoupled) ──
+_opp_coin_universe = []
+
+_ingest_running = False
+_ingest_progress = (0, 0)
+_ingest_last_run = None
+_ingest_error = None
+
 _opp_results = []
 _opp_last_run = None
 _opp_running = False
-_opp_progress = (0, 0)
-_opp_coin_universe = []
 _opp_error = None
 
 
-def run_full_opportunity_scan(days=14, position=1000):
-    global _opp_results, _opp_last_run, _opp_running, _opp_progress, _opp_coin_universe, _opp_error
-    if _opp_running:
+def ingestion_background():
+    """The slow part - real network calls to Bybit/OKX, parallelized.
+    Runs independently of the ranking loop below, so the page never
+    waits on this."""
+    global _opp_coin_universe, _ingest_running, _ingest_progress, _ingest_last_run, _ingest_error
+    init_store()
+    while True:
+        _ingest_running = True
+        _ingest_error = None
+        try:
+            if not _opp_coin_universe:
+                print("[web] fetching full Bybit/OKX coin universe...")
+                _opp_coin_universe = get_full_common_coin_universe()
+                print(f"[web] found {len(_opp_coin_universe)} coins common to both exchanges")
+
+            def progress_cb(done, total):
+                global _ingest_progress
+                _ingest_progress = (done, total)
+
+            ingest_all(_opp_coin_universe, days=30, progress_callback=progress_cb)
+            _ingest_last_run = datetime.now()
+        except Exception as e:
+            _ingest_error = str(e)
+            print(f"[web] ingestion failed: {e}")
+        finally:
+            _ingest_running = False
+            _ingest_progress = (0, 0)
+        time.sleep(INGEST_INTERVAL_SECONDS)
+
+
+def run_ranking_pass():
+    """The fast part - reads from the local store only. Safe to call
+    on demand (e.g. the 'Rescan now' button) since it makes no network
+    calls itself."""
+    global _opp_results, _opp_last_run, _opp_running, _opp_error
+    if _opp_running or not _opp_coin_universe:
         return
     _opp_running = True
     _opp_error = None
     try:
-        if not _opp_coin_universe:
-            print("[web] fetching full Bybit/OKX coin universe...")
-            _opp_coin_universe = get_full_common_coin_universe()
-            print(f"[web] found {len(_opp_coin_universe)} coins common to both exchanges")
-
-        def progress_cb(done, total):
-            global _opp_progress
-            _opp_progress = (done, total)
-
         results = scan_opportunity_matrix(
-            _opp_coin_universe, days, position, progress_callback=progress_cb
+            _opp_coin_universe, BACKTEST_DAYS_DEFAULT, POSITION_DEFAULT
         )
         _opp_results = results
         _opp_last_run = datetime.now()
     except Exception as e:
         _opp_error = str(e)
-        print(f"[web] opportunity scan failed: {e}")
+        print(f"[web] ranking pass failed: {e}")
     finally:
         _opp_running = False
-        _opp_progress = (0, 0)
 
 
-def opportunity_background():
+def ranking_background():
     while True:
-        run_full_opportunity_scan()
-        time.sleep(OPPORTUNITY_RESCAN_SECONDS)
+        run_ranking_pass()
+        time.sleep(RANK_INTERVAL_SECONDS)
 
 
 # ── SHARED PAGE STYLE ────────────────────────────────────────
@@ -302,23 +339,23 @@ OPPORTUNITIES_PAGE = """
 <style>{css}</style></head><body>
 {nav}
 <div class="note" style="margin-bottom:16px;">
-  Continuously scans <b>every coin listed on both Bybit and OKX</b>
-  ({universe_size} coins found) using real historical funding data,
-  ranked by risk-adjusted return - not just a single APY number.
-  <b>Max drawdown</b> is the worst peak-to-trough dip the spread ever
-  had; <b>Sharpe-like</b> is mean gap / gap volatility (higher = steadier
-  edge, near-zero = noisy/unreliable even if the average looks fine).
-  Runs automatically every 3 hours in the background - this page just
-  shows the latest cached results, so it loads instantly.
+  Scans every real cryptocurrency listed on both Bybit and OKX
+  ({universe_size} coins found, tokenized stock perpetuals like IBM/TSLA
+  filtered out) using real historical funding data. <b>Ingestion</b>
+  (pulling data from the exchanges, in parallel) and <b>ranking</b>
+  (computing APY/drawdown/Sharpe from what's already stored locally) run
+  as two separate background loops - this page only ever reads the local
+  cache, so it loads instantly regardless of how long ingestion takes.
 </div>
-<div class="meta">{status_line}</div>
+<div class="meta">{ingest_status}</div>
+<div class="meta">{rank_status}</div>
 <form method="get" action="/opportunities">
   <div><label>Show top</label>
     <select name="top">{top_options}</select>
   </div>
   <button type="submit">Apply</button>
   <a href="/opportunities/rescan"><button type="button" class="secondary"
-     onclick="this.form" style="margin-left:4px;">Rescan now</button></a>
+     style="margin-left:4px;">Re-rank now</button></a>
 </form>
 {result_html}
 </body></html>
@@ -455,19 +492,33 @@ def render_multi_backtest_page():
 def render_opportunities_page():
     top_n = int(request.args.get("top", 10))
 
+    if _ingest_running:
+        done, total = _ingest_progress
+        ingest_status = f'<span style="color:#facc15">Ingesting: {done}/{total} (exchange, coin) pairs...</span>'
+    elif _ingest_error:
+        ingest_status = f'<span style="color:#f87171">Last ingestion failed: {_ingest_error}</span>'
+    elif _ingest_last_run is None:
+        ingest_status = "Ingestion starting up - fetching data from exchanges for the first time..."
+    else:
+        age_min = (datetime.now() - _ingest_last_run).total_seconds() / 60
+        stats = get_store_stats()
+        ingest_status = (
+            f"Data ingestion: last run {age_min:.0f} min ago \u00b7 "
+            f"{stats['total_rows']} funding records stored \u00b7 "
+            f"refreshes every {INGEST_INTERVAL_SECONDS // 60} min"
+        )
+
     if _opp_running:
-        done, total = _opp_progress
-        status = f'<span style="color:#facc15">Scan in progress: {done}/{total} coins checked...</span>'
+        rank_status = '<span style="color:#facc15">Ranking...</span>'
     elif _opp_error:
-        status = f'<span style="color:#f87171">Last scan failed: {_opp_error}</span>'
+        rank_status = f'<span style="color:#f87171">Last ranking pass failed: {_opp_error}</span>'
     elif _opp_last_run is None:
-        status = "First scan starting up in the background - this can take a few minutes for the full coin universe. Refresh shortly."
+        rank_status = "Waiting for the first ingestion pass to complete before ranking can run."
     else:
         age_min = (datetime.now() - _opp_last_run).total_seconds() / 60
-        status = (
-            f"Last full scan: {_opp_last_run.strftime('%H:%M:%S')} "
-            f"({age_min:.0f} min ago) \u00b7 {len(_opp_results)} results with enough data \u00b7 "
-            f"rescans automatically every {OPPORTUNITY_RESCAN_SECONDS // 3600}h"
+        rank_status = (
+            f"Ranking: last run {age_min:.0f} min ago \u00b7 {len(_opp_results)} results with "
+            f"enough data \u00b7 refreshes every {RANK_INTERVAL_SECONDS // 60} min"
         )
 
     if _opp_results:
@@ -500,7 +551,7 @@ def render_opportunities_page():
         spikes.</div>
         """
     else:
-        result_html = '<div class="note">No results yet - the background scan is still running or hasn\'t started.</div>'
+        result_html = '<div class="note">No results yet - waiting on the first ingestion + ranking pass.</div>'
 
     def top_options():
         return "".join(
@@ -511,7 +562,8 @@ def render_opportunities_page():
     nav = NAV.format(scanner_active="", backtest_active="", multi_active="", opp_active="active")
     return OPPORTUNITIES_PAGE.format(
         css=BASE_CSS, nav=nav, universe_size=len(_opp_coin_universe),
-        status_line=status, top_options=top_options(), result_html=result_html,
+        ingest_status=ingest_status, rank_status=rank_status,
+        top_options=top_options(), result_html=result_html,
     )
 
 
@@ -537,14 +589,18 @@ def opportunities_route():
 
 @app.route("/opportunities/rescan")
 def opportunities_rescan_route():
+    # Only re-runs the fast, local RANKING pass, not ingestion - ingestion
+    # keeps running on its own slower schedule regardless. This is why
+    # "Re-rank now" returns almost instantly instead of taking minutes.
     if not _opp_running:
-        threading.Thread(target=run_full_opportunity_scan, daemon=True).start()
+        threading.Thread(target=run_ranking_pass, daemon=True).start()
     return redirect("/opportunities")
 
 
 if __name__ == "__main__":
     threading.Thread(target=background_scanner, daemon=True).start()
-    threading.Thread(target=opportunity_background, daemon=True).start()
+    threading.Thread(target=ingestion_background, daemon=True).start()
+    threading.Thread(target=ranking_background, daemon=True).start()
 
     port = int(os.getenv("SERVER_PORT", 8080))
     print(f"Starting web dashboard on 0.0.0.0:{port}")

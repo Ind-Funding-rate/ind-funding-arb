@@ -7,7 +7,9 @@ Runs the full-market scanner continuously in a background thread (so we
 never stop monitoring), keeps the latest results in memory, and serves
 them as plain server-rendered HTML - no JS framework, no build step,
 loads fast on a free-tier server. A small amount of vanilla JS handles
-the scanner's search box and sortable columns client-side.
+the scanner's search box, sortable columns, and the coin autocomplete
+(built as custom JS rather than native <datalist>, which has inconsistent
+support on some mobile browsers).
 
 Binds to whatever port HidenCloud/Pterodactyl assigns via the SERVER_PORT
 env var (falls back to 8080 if not set, for local testing).
@@ -15,6 +17,7 @@ env var (falls back to 8080 if not set, for local testing).
 import sys
 import threading
 import time
+import json as pyjson
 from pathlib import Path
 from datetime import datetime
 import os
@@ -38,9 +41,8 @@ LOW_LIQUIDITY_USD = 50_000
 
 # Coins SUGGESTED in the multi-exchange backtest search box - liquid,
 # widely listed as perpetuals across Binance/Bybit/OKX. This is only a
-# suggestion list (via <datalist>) - the field is a free-text input, so
-# any coin ticker can still be typed and submitted even if it's not in
-# this list (e.g. a newer or less common listing).
+# suggestion list - the field is free-text, so any ticker can still be
+# typed and submitted even if it's not in this list.
 MULTI_BACKTEST_COINS = [
     "BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "LINK", "AVAX", "DOT",
     "LTC", "BCH", "UNI", "SUI", "TRX", "NEAR", "OP", "INJ", "RUNE",
@@ -104,6 +106,13 @@ BASE_CSS = """
   .card p span:first-child { color:#8b8fa3; }
   .note { color:#8b8fa3; font-size:12px; margin-top:16px; line-height:1.5; }
   a.coin-link { color:#e6e6e6; text-decoration:underline dotted; }
+  .autocomplete-wrap { position:relative; }
+  .autocomplete-list { position:absolute; top:100%; left:0; right:0; z-index:20;
+                        background:#1a1d27; border:1px solid #2a2d38; border-top:none;
+                        border-radius:0 0 6px 6px; max-height:220px; overflow-y:auto;
+                        display:none; }
+  .autocomplete-list div { padding:8px 10px; cursor:pointer; text-align:left; font-size:14px; }
+  .autocomplete-list div:hover, .autocomplete-list div.active-item { background:#2a2d38; }
 """
 
 NAV = """
@@ -200,10 +209,12 @@ MULTI_BACKTEST_PAGE = """
     <select name="exchange_a">{exchange_a_options}</select></div>
   <div><label>Short exchange</label>
     <select name="exchange_b">{exchange_b_options}</select></div>
-  <div><label>Coin (type to search)</label>
-    <input list="coin-suggestions" name="coin" value="{coin}" style="width:110px"
-           placeholder="e.g. BTC" autocomplete="off">
-    <datalist id="coin-suggestions">{coin_datalist}</datalist>
+  <div class="autocomplete-wrap">
+    <label>Coin (type to search)</label>
+    <input id="coin-input" name="coin" value="{coin}" style="width:110px"
+           placeholder="e.g. BTC" autocomplete="off"
+           oninput="showCoinSuggestions()" onfocus="showCoinSuggestions()">
+    <div id="coin-suggestions" class="autocomplete-list"></div>
   </div>
   <div><label>Days</label><input name="days" type="number" value="{days}" style="width:70px"></div>
   <div><label>Position ($)</label><input name="position" type="number" value="{position}" style="width:110px"></div>
@@ -219,6 +230,29 @@ MULTI_BACKTEST_PAGE = """
   unlisted one returns "no matched data", it likely isn't a perpetual on
   one of the two selected exchanges.
 </div>
+<script>
+const ALL_COINS = {coins_json};
+function showCoinSuggestions() {{
+  const input = document.getElementById('coin-input');
+  const box = document.getElementById('coin-suggestions');
+  const q = input.value.toUpperCase();
+  const matches = ALL_COINS.filter(c => c.startsWith(q)).slice(0, 8);
+  if (matches.length === 0) {{ box.style.display = 'none'; return; }}
+  box.innerHTML = matches.map(c =>
+    `<div onclick="selectCoin('${{c}}')">${{c}}</div>`
+  ).join('');
+  box.style.display = 'block';
+}}
+function selectCoin(c) {{
+  document.getElementById('coin-input').value = c;
+  document.getElementById('coin-suggestions').style.display = 'none';
+}}
+document.addEventListener('click', function(e) {{
+  if (!e.target.closest('.autocomplete-wrap')) {{
+    document.getElementById('coin-suggestions').style.display = 'none';
+  }}
+}});
+</script>
 </body></html>
 """
 
@@ -352,15 +386,12 @@ def render_multi_backtest_page():
             for e in exchanges
         )
 
-    def coin_datalist():
-        return "".join(f'<option value="{c}">' for c in MULTI_BACKTEST_COINS)
-
     nav = NAV.format(scanner_active="", backtest_active="", multi_active="active")
     return MULTI_BACKTEST_PAGE.format(
         css=BASE_CSS, nav=nav,
         exchange_a_options=exchange_options(exchange_a),
         exchange_b_options=exchange_options(exchange_b),
-        coin=coin, coin_datalist=coin_datalist(),
+        coin=coin, coins_json=pyjson.dumps(MULTI_BACKTEST_COINS),
         days=days, position=int(position), result_html=result_html,
     )
 

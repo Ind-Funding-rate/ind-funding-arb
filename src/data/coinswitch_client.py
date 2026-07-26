@@ -10,16 +10,17 @@ Confirmed directly from CoinSwitch's own official docs
     - Signed message = METHOD + path_with_query (URL-decoded) + epoch_ms
     - Headers: X-AUTH-APIKEY, X-AUTH-SIGNATURE, X-AUTH-EPOCH
     - GET /trade/api/v2/futures/all-pairs/ticker?exchange=EXCHANGE_2
-      returns ALL futures symbols' tickers (incl. funding_rate,
-      next_funding_timestamp, mark_price) in ONE call - no need to
-      iterate coin by coin.
+      claims to return ALL futures symbols' tickers (incl. funding_rate,
+      next_funding_timestamp, mark_price) in ONE call - UNVERIFIED, not
+      seen in the official reference pages reviewed manually. Being
+      tested directly below before this is trusted for the live scanner.
     - funding_rate is a plain decimal fraction (e.g. 0.00039681 =
-      0.039681%) - same convention as Pi42, no unit conversion needed
-      (unlike Delta, which needed a /100 fix).
+      0.039681%) - same convention as Pi42, confirmed against the
+      CoinSwitch PRO app's displayed funding rate on 2026-07-26.
 
-CoinSwitch has NOT been confirmed to offer historical funding data - only
-this live snapshot. So (like Pi42 and Delta) it belongs in the live
-scanner, not the historical backtest/ingestion pipeline.
+NOTE (2026-07-26): env var name fixed below - this project's .env uses
+COINSWITCH_API_SECRET (confirmed working via src/data/test_coinswitch_auth.py
+and src/data/fetch_coinswitch_rate.py), not COINSWITCH_SECRET_KEY.
 """
 import time
 import requests
@@ -37,11 +38,11 @@ def _sign_request(method: str, path: str, params: dict = None):
     """Builds the exact signed_message CoinSwitch expects and returns
     (headers, full_path_with_query) ready to use in a requests call."""
     api_key = os.getenv("COINSWITCH_API_KEY")
-    secret_key_hex = os.getenv("COINSWITCH_SECRET_KEY")
+    secret_key_hex = os.getenv("COINSWITCH_API_SECRET")
 
     if not api_key or not secret_key_hex:
         raise RuntimeError(
-            "COINSWITCH_API_KEY or COINSWITCH_SECRET_KEY not found in .env - "
+            "COINSWITCH_API_KEY or COINSWITCH_API_SECRET not found in .env - "
             "check they're set at /home/container/.env"
         )
 
@@ -66,11 +67,13 @@ def _sign_request(method: str, path: str, params: dict = None):
 def get_all_funding_rates():
     """Returns {symbol: {"funding_rate": float, "mark_price": float,
     "next_funding_ts": int}} for every futures pair on CoinSwitch, in one
-    API call. Symbol format matches their convention, e.g. "BTCUSDT"."""
+    API call (IF the endpoint is real - being verified). Symbol format
+    matches their convention, e.g. "BTCUSDT"."""
     path = "/trade/api/v2/futures/all-pairs/ticker"
     headers, path_with_query = _sign_request("GET", path, {"exchange": "EXCHANGE_2"})
 
     r = requests.get(BASE_URL + path_with_query, headers=headers, timeout=15)
+    print(f"  [debug] HTTP {r.status_code}")
     r.raise_for_status()
     body = r.json()
 
@@ -88,8 +91,15 @@ if __name__ == "__main__":
     # Quick manual test - confirms real credentials + real data, not a mock
     print("Testing CoinSwitch futures ticker fetch...")
     print(f"API key loaded: {'yes' if os.getenv('COINSWITCH_API_KEY') else 'NO - check .env'}")
-    print(f"Secret loaded:   {'yes' if os.getenv('COINSWITCH_SECRET_KEY') else 'NO - check .env'}")
-    rates = get_all_funding_rates()
-    print(f"Got {len(rates)} symbols")
-    if "BTCUSDT" in rates:
-        print("BTCUSDT:", rates["BTCUSDT"])
+    print(f"Secret loaded:   {'yes' if os.getenv('COINSWITCH_API_SECRET') else 'NO - check .env'}")
+    try:
+        rates = get_all_funding_rates()
+        print(f"Got {len(rates)} symbols")
+        if "BTCUSDT" in rates:
+            print("BTCUSDT:", rates["BTCUSDT"])
+        else:
+            print("BTCUSDT not in response. Sample keys:", list(rates.keys())[:10])
+    except Exception as e:
+        print(f"FAILED: {e}")
+        print("This means the bulk 'all-pairs/ticker' endpoint is likely NOT real.")
+        print("Fall back plan: fetch symbols one at a time via /futures/ticker instead.")

@@ -1,14 +1,18 @@
 """
-Minimal web dashboard - 6 pages: live scanner, Indian exchanges overview,
-Indian opportunities, Delta/Pi42 backtest (our own logged data),
-multi-exchange historical backtest, and an automated opportunity matrix
-scanner across ALL available coins x exchange pairs.
+Minimal web dashboard - 7 pages: live scanner, Indian exchanges overview,
+Indian opportunities, 3-way scanner (+ CoinSwitch), Delta/Pi42 backtest
+(our own logged data), multi-exchange historical backtest, and an
+automated opportunity matrix scanner across ALL available coins x
+exchange pairs.
 
-Runs THREE background loops, decoupled from each other:
+Runs FOUR background loops, decoupled from each other:
 1. Live full-market scanner (Delta vs Pi42, 133 coins, every ~90s)
-2. INGESTION: pulls historical data from Bybit/OKX into our own local
+2. Live 3-way scanner (Delta + Pi42 + CoinSwitch, every ~90s) - added
+   2026-07-26 once CoinSwitch's bulk funding-rate endpoint was confirmed
+   real and working (651 symbols in a single call).
+3. INGESTION: pulls historical data from Bybit/OKX into our own local
    database, in parallel (ThreadPoolExecutor), every 30 min.
-3. RANKING: reads from that local database (fast, no network) and
+4. RANKING: reads from that local database (fast, no network) and
    recomputes the ranked opportunity list every 5 min.
 
 Binds to whatever port HidenCloud/Pterodactyl assigns via the SERVER_PORT
@@ -30,6 +34,10 @@ from dotenv import load_dotenv
 load_dotenv("/home/container/.env")
 
 from src.execution.full_market_scanner import run_scan_cycle, CYCLE_SECONDS, ROUND_TRIP
+from src.execution.three_way_scanner import (
+    run_scan_cycle as run_three_way_scan_cycle,
+    CYCLE_SECONDS as THREE_WAY_CYCLE_SECONDS,
+)
 from src.execution.backtest_engine import compute_backtest
 from src.execution.multi_exchange_backtest import compute_multi_backtest, GENERIC_ROUND_TRIP_PCT
 from src.execution.advanced_backtest import (
@@ -57,9 +65,16 @@ POSITION_DEFAULT        = 1000
 
 # ── INDIAN EXCHANGE REGISTRY ──────────────────────────────────
 # Only exchanges actually connected and streaming live data are listed
-# here. Others were evaluated (CoinDCX, Shark Exchange, CoinSwitch PRO,
-# WazirX, Zebpay, Mudrex, Coinbase India) but excluded - none currently
-# offer both perpetual futures AND a public funding-rate API.
+# here. Others were evaluated (CoinDCX, Shark Exchange, WazirX, Zebpay,
+# Mudrex, Coinbase India) but excluded - none currently offer both
+# perpetual futures AND a public funding-rate API.
+#
+# UPDATE (2026-07-26): CoinSwitch PRO was re-evaluated and DOES have both
+# - confirmed live via src/data/coinswitch_client.py using their bulk
+# /trade/api/v2/futures/all-pairs/ticker endpoint (651 symbols, one call).
+# It's kept out of this specific registry/2-way page for now and instead
+# powers the separate "3-Way" page below, so the existing Delta/Pi42
+# Indian Exchanges + Opportunities pages stay exactly as they were.
 INDIAN_EXCHANGE_REGISTRY = [
     {
         "name": "Delta Exchange India",
@@ -106,6 +121,25 @@ def background_scanner():
             _scan_error = str(e)
             print(f"[web] scan cycle failed: {e}")
         time.sleep(CYCLE_SECONDS)
+
+
+# ── SHARED STATE: 3-way scanner (Delta + Pi42 + CoinSwitch) ─────
+_three_way_rows = []
+_three_way_last_scan_time = None
+_three_way_error = None
+
+
+def background_three_way_scanner():
+    global _three_way_rows, _three_way_last_scan_time, _three_way_error
+    while True:
+        try:
+            _three_way_rows = run_three_way_scan_cycle()
+            _three_way_last_scan_time = datetime.now()
+            _three_way_error = None
+        except Exception as e:
+            _three_way_error = str(e)
+            print(f"[web] 3-way scan cycle failed: {e}")
+        time.sleep(THREE_WAY_CYCLE_SECONDS)
 
 
 # ── SHARED STATE: opportunity matrix (ingestion + ranking, decoupled) ──
@@ -243,6 +277,7 @@ NAV = """
   <a href="/" class="{scanner_active}">Scanner</a>
   <a href="/indian-exchanges" class="{indian_active}">\U0001f1ee\U0001f1f3 Indian Exchanges</a>
   <a href="/indian-opportunities" class="{indiaopp_active}">\U0001f1ee\U0001f1f3 Opportunities</a>
+  <a href="/three-way" class="{threeway_active}">3-Way (+CoinSwitch)</a>
   <a href="/backtest" class="{backtest_active}">Backtest (ours)</a>
   <a href="/multi-backtest" class="{multi_active}">Backtest (multi-exchange)</a>
   <a href="/opportunities" class="{opp_active}">Opportunities (global)</a>
@@ -294,6 +329,36 @@ SCANNER_PAGE = """
   <th onclick="sortTable(3,true)">Gap pp</th>
   <th onclick="sortTable(4,true)">Net %</th>
   <th onclick="sortTable(5,true)">Delta Vol ($)</th>
+</tr></thead>
+<tbody>{rows}</tbody>
+</table>
+{js}
+</body></html>
+"""
+
+THREE_WAY_PAGE = """
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3-Way Scanner (+CoinSwitch)</title>
+<style>{css}</style></head><body>
+{nav}
+<div class="meta">{status_line}</div>
+<div class="note" style="margin-bottom:16px;">
+  Compares Delta, Pi42, and CoinSwitch pairwise for every coin and shows
+  whichever pair currently has the best fee-adjusted net%. Standalone
+  from the main Scanner/Opportunities pages above (separate CSV log,
+  separate Telegram alerts) so nothing there is affected by this.
+</div>
+<input id="search" placeholder="Filter by coin..." onkeyup="filterTable()">
+<table id="tbl">
+<thead><tr>
+  <th onclick="sortTable(0,false)">Coin</th>
+  <th onclick="sortTable(1,false)">Best Pair</th>
+  <th onclick="sortTable(2,true)">Delta %</th>
+  <th onclick="sortTable(3,true)">Pi42 %</th>
+  <th onclick="sortTable(4,true)">CoinSwitch %</th>
+  <th onclick="sortTable(5,true)">Gap pp</th>
+  <th onclick="sortTable(6,true)">Net %</th>
 </tr></thead>
 <tbody>{rows}</tbody>
 </table>
@@ -543,8 +608,43 @@ def render_scanner_page():
         rows_html = "<tr><td colspan='6'>No data yet.</td></tr>"
 
     nav = NAV.format(scanner_active="active", backtest_active="", multi_active="",
-                     opp_active="", indian_active="", indiaopp_active="")
+                     opp_active="", indian_active="", indiaopp_active="", threeway_active="")
     return SCANNER_PAGE.format(css=BASE_CSS, nav=nav, status_line=status, rows=rows_html, js=SCANNER_JS)
+
+
+def render_three_way_page():
+    if _three_way_error:
+        status = f'<span style="color:#f87171">Last scan failed: {_three_way_error}</span>'
+    elif _three_way_last_scan_time is None:
+        status = "First scan starting up (~30-40s, Pi42 websocket step is the slow part)..."
+    else:
+        age = (datetime.now() - _three_way_last_scan_time).total_seconds()
+        profitable_count = sum(1 for r in _three_way_rows if r["profitable"])
+        status = (
+            f"Last scan: {_three_way_last_scan_time.strftime('%H:%M:%S')} "
+            f"({int(age)}s ago) \u00b7 {len(_three_way_rows)} coins checked (2+ exchanges) \u00b7 "
+            f"{profitable_count} profitable \u00b7 type to filter, click headers to sort"
+        )
+
+    rows_html = ""
+    for r in _three_way_rows:
+        cls = "profit" if r["profitable"] else ("near" if r["net_pct"] > -0.05 else "loss")
+        rows_html += (
+            f"<tr data-coin='{r['coin'].lower()}'>"
+            f"<td><a class='coin-link' href='/backtest?coin={r['coin']}'>{r['coin']}</a></td>"
+            f"<td style='text-align:left'>{r['best_pair']}</td>"
+            f"<td>{r['delta_funding_pct']}</td>"
+            f"<td>{r['pi42_funding_pct']}</td>"
+            f"<td>{r['coinswitch_funding_pct']}</td>"
+            f"<td>{r['gap_pct']:.5f}</td>"
+            f"<td class='{cls}'>{r['net_pct']:+.5f}</td></tr>"
+        )
+    if not rows_html:
+        rows_html = "<tr><td colspan='7'>No data yet.</td></tr>"
+
+    nav = NAV.format(scanner_active="", backtest_active="", multi_active="",
+                     opp_active="", indian_active="", indiaopp_active="", threeway_active="active")
+    return THREE_WAY_PAGE.format(css=BASE_CSS, nav=nav, status_line=status, rows=rows_html, js=SCANNER_JS)
 
 
 def render_backtest_page():
@@ -579,7 +679,7 @@ def render_backtest_page():
         """
 
     nav = NAV.format(scanner_active="", backtest_active="active", multi_active="",
-                     opp_active="", indian_active="", indiaopp_active="")
+                     opp_active="", indian_active="", indiaopp_active="", threeway_active="")
     return BACKTEST_PAGE.format(css=BASE_CSS, nav=nav, coin=coin, days=days,
                                  position=int(position), result_html=result_html)
 
@@ -626,7 +726,7 @@ def render_multi_backtest_page():
         )
 
     nav = NAV.format(scanner_active="", backtest_active="", multi_active="active",
-                     opp_active="", indian_active="", indiaopp_active="")
+                     opp_active="", indian_active="", indiaopp_active="", threeway_active="")
     return MULTI_BACKTEST_PAGE.format(
         css=BASE_CSS, nav=nav,
         exchange_a_options=exchange_options(exchange_a),
@@ -707,7 +807,7 @@ def render_opportunities_page():
         )
 
     nav = NAV.format(scanner_active="", backtest_active="", multi_active="",
-                     opp_active="active", indian_active="", indiaopp_active="")
+                     opp_active="active", indian_active="", indiaopp_active="", threeway_active="")
     return OPPORTUNITIES_PAGE.format(
         css=BASE_CSS, nav=nav, universe_size=len(_opp_coin_universe),
         ingest_status=ingest_status, rank_status=rank_status,
@@ -764,7 +864,7 @@ def render_indian_exchanges_page():
         )
 
     nav = NAV.format(scanner_active="", backtest_active="", multi_active="",
-                     opp_active="", indian_active="active", indiaopp_active="")
+                     opp_active="", indian_active="active", indiaopp_active="", threeway_active="")
     return INDIAN_EXCHANGES_PAGE.format(
         css=BASE_CSS, nav=nav,
         delta_btc_rate=delta_btc_rate,
@@ -868,7 +968,7 @@ def render_indian_opportunities_page():
         near_section = ""
 
     nav = NAV.format(scanner_active="", backtest_active="", multi_active="",
-                     opp_active="", indian_active="", indiaopp_active="active")
+                     opp_active="", indian_active="", indiaopp_active="active", threeway_active="")
     return INDIAN_OPPORTUNITIES_PAGE.format(
         css=BASE_CSS, nav=nav,
         scan_time=scan_time,
@@ -889,6 +989,11 @@ def render_indian_opportunities_page():
 @app.route("/")
 def scanner_route():
     return render_scanner_page()
+
+
+@app.route("/three-way")
+def three_way_route():
+    return render_three_way_page()
 
 
 @app.route("/indian-exchanges")
@@ -925,6 +1030,7 @@ def opportunities_rescan_route():
 
 if __name__ == "__main__":
     threading.Thread(target=background_scanner, daemon=True).start()
+    threading.Thread(target=background_three_way_scanner, daemon=True).start()
     threading.Thread(target=ingestion_background, daemon=True).start()
     threading.Thread(target=ranking_background, daemon=True).start()
 

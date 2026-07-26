@@ -324,6 +324,8 @@ BASE_CSS = """
               font-size:11px; padding:2px 8px; border-radius:4px; }
   .section-title { font-size:13px; color:#8b8fa3; font-weight:600;
                    letter-spacing:.08em; margin:28px 0 12px; }
+  .pulse-dot { animation: pulsebeat 2s infinite; }
+  @keyframes pulsebeat { 0%,100% { opacity:1; } 50% { opacity:.5; } }
 """
 
 NAV = """
@@ -444,7 +446,7 @@ function showCoinSuggestions() {{
   const q = input.value.toUpperCase();
   const matches = ALL_COINS.filter(c => c.startsWith(q)).slice(0, 8);
   if (matches.length === 0) {{ box.style.display = 'none'; return; }}
-  box.innerHTML = matches.map(c => `<div onclick="selectCoin('${{c}}')">\${{c}}</div>`).join('');
+  box.innerHTML = matches.map(c => `<div onclick="selectCoin('${{c}}')">${{c}}</div>`).join('');
   box.style.display = 'block';
 }}
 function selectCoin(c) {{
@@ -489,7 +491,7 @@ OPPORTUNITIES_PAGE = """
 </body></html>
 """
 
-# ── NEW: Indian Exchanges page template ───────────────────────
+# ── Indian Exchanges page template ────────────────────────
 INDIAN_EXCHANGES_PAGE = """
 <!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -562,15 +564,12 @@ INDIAN_EXCHANGES_PAGE = """
 </body></html>
 """
 
-# ── NEW: Indian Opportunities page template ───────────────────
+# ── Indian Opportunities page template ────────────────────
 INDIAN_OPPORTUNITIES_PAGE = """
 <!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Indian Opportunities \u2014 Funding Arb</title>
-<style>{css}
-auto { animation: pulse 2s infinite; }
-@keyframes pulse {{ 0%,100% {{ opacity:1; }} 50% {{ opacity:.5; }} }}
-</style></head><body>
+<style>{css}</style></head><body>
 {nav}
 
 <h2 style="font-size:18px;margin:0 0 6px;">\U0001f1ee\U0001f1f3 Indian Exchange Opportunities</h2>
@@ -825,7 +824,6 @@ def render_opportunities_page():
     )
 
 
-# ── NEW: Indian Exchanges page render ─────────────────────────
 def render_indian_exchanges_page():
     # Pull live BTC rates from the existing scanner data (no extra API calls)
     btc_row = next((r for r in _latest_rows if r["coin"] == "BTC"), None)
@@ -839,7 +837,6 @@ def render_indian_exchanges_page():
 
     scan_time = _last_scan_time.strftime("%H:%M:%S") if _last_scan_time else "Starting..."
 
-    # Build exchange matrix rows
     api_map = {
         "full":    '<span class="badge-live">\u2705 Full</span>',
         "partial": '<span class="badge-soon">\u26a0\ufe0f Partial</span>',
@@ -886,7 +883,6 @@ def render_indian_exchanges_page():
     )
 
 
-# ── NEW: Indian Opportunities page render ─────────────────────
 def render_indian_opportunities_page():
     scan_time   = _last_scan_time.strftime("%H:%M:%S") if _last_scan_time else "Starting..."
     total_coins = len(_latest_rows)
@@ -895,7 +891,6 @@ def render_indian_opportunities_page():
     profitable = [r for r in _latest_rows if r["profitable"]]
     near       = [r for r in _latest_rows if not r["profitable"] and r["net_pct"] > -0.10]
 
-    # Summary stats
     profitable_count  = len(profitable)
     near_count        = len(near)
     profitable_color  = "#4ade80" if profitable_count > 0 else "#8b8fa3"
@@ -909,7 +904,6 @@ def render_indian_opportunities_page():
         best_coin = "None"
         best_net  = "0.00000"
 
-    # Profitable table
     if profitable:
         p_rows = ""
         for r in sorted(profitable, key=lambda r: r["net_pct"], reverse=True):
@@ -919,7 +913,7 @@ def render_indian_opportunities_page():
                 else "Short Pi42 \u00b7 Long Delta"
             )
             thin = '<span class="thin">thin</span>' if r["delta_volume_usd"] < LOW_LIQUIDITY_USD else ""
-            apy_est = r["net_pct"] * 3 * 365  # 3 funding periods per day
+            apy_est = r["net_pct"] * 3 * 365
             p_rows += (
                 f"<tr>"
                 f"<td><a class='coin-link' href='/backtest?coin={r['coin']}'>{r['coin']}</a>{thin}</td>"
@@ -951,7 +945,6 @@ def render_indian_opportunities_page():
             f'{fee_floor}%. Near misses are shown below.</div>'
         )
 
-    # Near misses table
     if near:
         n_rows = ""
         for r in sorted(near, key=lambda r: r["net_pct"], reverse=True)[:15]:

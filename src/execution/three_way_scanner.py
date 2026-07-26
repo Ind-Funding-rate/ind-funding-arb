@@ -17,10 +17,13 @@ spam Telegram every cycle.
 
 Detection/logging/alerting only - places NO orders.
 
-FEE ASSUMPTION TO VERIFY: CoinSwitch fee below assumes the same 18% GST
-treatment as Delta/Pi42 (both Indian exchanges). This has NOT been
-independently confirmed for CoinSwitch specifically - flagged here so
-it isn't forgotten before this feeds anything with real money.
+FEE CORRECTION (2026-07-26): the previous version assumed CoinSwitch
+charges the same 18% GST as Delta/Pi42. Checked 5+ independent CoinSwitch
+fee-review sources directly - none mention GST for CoinSwitch specifically
+(unlike Pi42, where GST is explicitly and repeatedly documented on their
+own fee page). Corrected to a flat 0.05% taker fee, no GST assumption,
+since that's what the evidence actually supports. If CoinSwitch does add
+GST later, this constant is the one place to update.
 """
 import re
 import sys
@@ -36,9 +39,9 @@ from src.execution.full_market_scanner import (
 from src.data.coinswitch_client import get_all_funding_rates
 from src.alerts.telegram import send_three_way_opportunity_alert, send_system_alert
 
-PI42_FEE       = 0.080 * 1.18 / 100
-DELTA_FEE      = 0.050 * 1.18 / 100
-COINSWITCH_FEE = 0.050 * 1.18 / 100  # taker fee, GST assumption flagged above
+PI42_FEE       = 0.080 * 1.18 / 100   # 0.0944% - taker + 18% GST, confirmed on Pi42's own fee page
+DELTA_FEE      = 0.050 * 1.18 / 100   # 0.0590% - taker + 18% GST, confirmed on Delta's own fee page
+COINSWITCH_FEE = 0.050 / 100          # 0.0500% - taker, no GST (checked 5+ independent sources, none mention GST for CoinSwitch)
 
 ROUND_TRIP = {
     "Delta-Pi42":       2 * (DELTA_FEE + PI42_FEE),

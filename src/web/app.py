@@ -56,8 +56,10 @@ BACKTEST_DAYS_DEFAULT   = 14
 POSITION_DEFAULT        = 1000
 
 # ── INDIAN EXCHANGE REGISTRY ──────────────────────────────────
-# Static data about every Indian crypto exchange, used on the
-# /indian-exchanges overview page.
+# Only exchanges actually connected and streaming live data are listed
+# here. Others were evaluated (CoinDCX, Shark Exchange, CoinSwitch PRO,
+# WazirX, Zebpay, Mudrex, Coinbase India) but excluded - none currently
+# offer both perpetual futures AND a public funding-rate API.
 INDIAN_EXCHANGE_REGISTRY = [
     {
         "name": "Delta Exchange India",
@@ -84,97 +86,6 @@ INDIAN_EXCHANGE_REGISTRY = [
         "api_docs": "https://docs.pi42.com",
         "fiu_registered": True,
         "notes": "FIU-registered. INR-native margin. Claims no TDS/VDA tax. Primary long leg.",
-    },
-    {
-        "name": "CoinDCX",
-        "type": "Spot + Futures",
-        "inr_deposit": "UPI · Bank Transfer",
-        "futures": True,
-        "pairs": "20+",
-        "funding_interval": "8 hrs",
-        "api_status": "partial",
-        "integration": "coming_soon",
-        "api_docs": "https://docs.coindcx.com",
-        "fiu_registered": True,
-        "notes": "Has futures but funding rate not available in public REST API.",
-    },
-    {
-        "name": "Shark Exchange",
-        "type": "Derivatives",
-        "inr_deposit": "UPI",
-        "futures": True,
-        "pairs": "10+",
-        "funding_interval": "8 hrs",
-        "api_status": "none",
-        "integration": "no_api",
-        "api_docs": None,
-        "fiu_registered": True,
-        "notes": "No public API documentation found. Cannot integrate without docs.",
-    },
-    {
-        "name": "CoinSwitch PRO",
-        "type": "Aggregator",
-        "inr_deposit": "UPI",
-        "futures": True,
-        "pairs": "20+",
-        "funding_interval": "8 hrs",
-        "api_status": "partial",
-        "integration": "not_suitable",
-        "api_docs": "https://developers.coinswitch.co",
-        "fiu_registered": True,
-        "notes": "Aggregator \u2014 routes to partner exchanges. Extra fee layer kills arbitrage margin.",
-    },
-    {
-        "name": "WazirX",
-        "type": "Spot Only",
-        "inr_deposit": "UPI · Bank",
-        "futures": False,
-        "pairs": "500+ spot",
-        "funding_interval": "N/A",
-        "api_status": "partial",
-        "integration": "no_futures",
-        "api_docs": "https://docs.wazirx.com",
-        "fiu_registered": True,
-        "notes": "Spot trading only. No perpetual futures available.",
-    },
-    {
-        "name": "Zebpay",
-        "type": "Spot Only",
-        "inr_deposit": "UPI · Bank",
-        "futures": False,
-        "pairs": "50+ spot",
-        "funding_interval": "N/A",
-        "api_status": "partial",
-        "integration": "no_futures",
-        "api_docs": "https://developers.zebpay.com",
-        "fiu_registered": True,
-        "notes": "Spot trading only. No perpetual futures available.",
-    },
-    {
-        "name": "Mudrex",
-        "type": "Spot + Bots",
-        "inr_deposit": "UPI",
-        "futures": False,
-        "pairs": "100+ spot",
-        "funding_interval": "N/A",
-        "api_status": "none",
-        "integration": "no_futures",
-        "api_docs": None,
-        "fiu_registered": True,
-        "notes": "Crypto bot/investment platform. No perpetual futures for arb.",
-    },
-    {
-        "name": "Coinbase India",
-        "type": "Spot + Futures",
-        "inr_deposit": "IMPS (since June 2026)",
-        "futures": True,
-        "pairs": "20+",
-        "funding_interval": "8 hrs",
-        "api_status": "partial",
-        "integration": "coming_soon",
-        "api_docs": "https://docs.cdp.coinbase.com",
-        "fiu_registered": True,
-        "notes": "Launched India June 2026. Too new \u2014 monitoring for API stability.",
     },
 ]
 
@@ -324,8 +235,6 @@ BASE_CSS = """
               font-size:11px; padding:2px 8px; border-radius:4px; }
   .section-title { font-size:13px; color:#8b8fa3; font-weight:600;
                    letter-spacing:.08em; margin:28px 0 12px; }
-  .pulse-dot { animation: pulsebeat 2s infinite; }
-  @keyframes pulsebeat { 0%,100% { opacity:1; } 50% { opacity:.5; } }
 """
 
 NAV = """
@@ -491,7 +400,7 @@ OPPORTUNITIES_PAGE = """
 </body></html>
 """
 
-# ── Indian Exchanges page template ────────────────────────
+# ── Indian Exchanges page template (only connected exchanges shown) ──
 INDIAN_EXCHANGES_PAGE = """
 <!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -500,37 +409,25 @@ INDIAN_EXCHANGES_PAGE = """
 {nav}
 
 <h2 style="font-size:18px;margin:0 0 6px;">\U0001f1ee\U0001f1f3 Indian Crypto Exchanges</h2>
-<p class="meta">All Indian exchanges evaluated for funding rate arbitrage suitability. Live rates updated: {scan_time}</p>
+<p class="meta">Connected exchanges only. Live rates updated: {scan_time}</p>
 
-<div class="section-title">LIVE BTC FUNDING RATES \u2014 INTEGRATED EXCHANGES</div>
+<div class="section-title">LIVE BTC FUNDING RATES</div>
 <div class="stat-cards">
   <div class="stat-card">
     <div class="stat-label">DELTA EXCHANGE INDIA \u00b7 BTCUSD</div>
     <div class="stat-value" style="color:#4ade80">{delta_btc_rate}</div>
     <div class="stat-sub">per 8-hour funding period</div>
-    <div style="margin-top:10px"><span class="badge-live">\U0001f7e2 LIVE \u2014 Integrated</span></div>
+    <div style="margin-top:10px"><span class="badge-live">\U0001f7e2 LIVE</span></div>
   </div>
   <div class="stat-card">
     <div class="stat-label">PI42 \u00b7 BTCUSDT</div>
     <div class="stat-value" style="color:#4ade80">{pi42_btc_rate}</div>
     <div class="stat-sub">per funding period (4\u20138 hrs)</div>
-    <div style="margin-top:10px"><span class="badge-live">\U0001f7e2 LIVE \u2014 Integrated</span></div>
-  </div>
-  <div class="stat-card" style="opacity:0.55">
-    <div class="stat-label">COINDCX \u00b7 BTCUSDT</div>
-    <div class="stat-value" style="font-size:16px;color:#8b8fa3">No Public API</div>
-    <div class="stat-sub">Futures exist but funding rate not exposed</div>
-    <div style="margin-top:10px"><span class="badge-soon">\U0001f504 Coming Soon</span></div>
-  </div>
-  <div class="stat-card" style="opacity:0.55">
-    <div class="stat-label">SHARK EXCHANGE</div>
-    <div class="stat-value" style="font-size:16px;color:#8b8fa3">No API Docs</div>
-    <div class="stat-sub">No public API documentation found</div>
-    <div style="margin-top:10px"><span class="badge-no">\u274c No API</span></div>
+    <div style="margin-top:10px"><span class="badge-live">\U0001f7e2 LIVE</span></div>
   </div>
 </div>
 
-<div class="section-title">ALL INDIAN EXCHANGES \u2014 SUITABILITY MATRIX</div>
+<div class="section-title">CONNECTED EXCHANGES</div>
 <div style="overflow-x:auto">
 <table>
 <thead><tr>
@@ -549,17 +446,11 @@ INDIAN_EXCHANGES_PAGE = """
 </table>
 </div>
 
-<div class="note" style="margin-top:24px;max-width:700px">
-  <b>Why only Delta + Pi42 are fully integrated:</b>
-  Funding rate arbitrage requires perpetual futures \u2713, a live public API for funding rates \u2713,
-  and reliable WebSocket data \u2713.
-  CoinDCX has futures but their public REST API does not expose the current funding rate.
-  Shark Exchange has no published API documentation.
-  WazirX, Zebpay, and Mudrex are spot-only platforms.
-  CoinSwitch PRO is an aggregation platform that routes orders to partner exchanges and adds
-  an extra fee layer that eliminates the arbitrage margin.
-  Coinbase India launched in June 2026 and is too new to depend on.
-  We continuously monitor new exchanges and will integrate them the moment they meet all criteria.
+<div class="note" style="margin-top:24px;max-width:640px">
+  Funding rate arbitrage needs perpetual futures, a public funding-rate API, and reliable
+  WebSocket data. Delta Exchange India and Pi42 are the only Indian exchanges that meet all
+  three today, so they're the only ones connected. We'll add more here the moment another
+  exchange qualifies.
 </div>
 </body></html>
 """

@@ -1,23 +1,21 @@
 """
 3-Way Funding Gap Scanner (Delta + Pi42 + CoinSwitch)
 -------------------------------------------------------
-Standalone. Does NOT touch full_market_scanner.py, its CSV logs, its
-Telegram alerts, or the website - all of that keeps working exactly as
-before, untouched, while this is tested independently.
+Runs continuously, same pattern as full_market_scanner.py. Does NOT
+touch that file, its CSV logs, its Telegram alerts, or the website -
+all of that keeps working exactly as before, completely separate from
+this.
 
 For every coin, fetches funding rates from all 3 exchanges (where
 available) and checks all 3 possible pairs:
     Delta <-> Pi42
     Delta <-> CoinSwitch
     Pi42  <-> CoinSwitch
-...then reports whichever pair has the best fee-adjusted net% for that
-coin. Detection/logging only - places NO orders, sends NO Telegram
-alerts yet (easy to add once this is verified against real numbers).
+...then alerts on whichever pair has the best fee-adjusted net% for
+that coin, with a per-coin cooldown so the same opportunity doesn't
+spam Telegram every cycle.
 
-Reuses the existing, already-proven Delta and Pi42 fetchers from
-full_market_scanner.py rather than duplicating that logic, and the
-existing CoinSwitch bulk fetcher confirmed working on 2026-07-26
-(651 symbols in one call).
+Detection/logging/alerting only - places NO orders.
 
 FEE ASSUMPTION TO VERIFY: CoinSwitch fee below assumes the same 18% GST
 treatment as Delta/Pi42 (both Indian exchanges). This has NOT been
@@ -27,6 +25,7 @@ it isn't forgotten before this feeds anything with real money.
 import re
 import sys
 import csv
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -35,6 +34,7 @@ from src.execution.full_market_scanner import (
     COINS, get_delta_funding_all, get_pi42_funding_all,
 )
 from src.data.coinswitch_client import get_all_funding_rates
+from src.alerts.telegram import send_three_way_opportunity_alert, send_system_alert
 
 PI42_FEE       = 0.080 * 1.18 / 100
 DELTA_FEE      = 0.050 * 1.18 / 100
@@ -46,10 +46,14 @@ ROUND_TRIP = {
     "Pi42-CoinSwitch":  2 * (PI42_FEE + COINSWITCH_FEE),
 }
 
+CYCLE_SECONDS = 90
+PER_COIN_COOLDOWN_SECONDS = 30 * 60
+
 LOG_DIR = Path("/home/container/logs")
 LOG_DIR.mkdir(exist_ok=True)
 
 _MULTIPLIER_PREFIX = re.compile(r"^(1000|1M)")
+_last_alert_time = {}
 
 
 def strip_multiplier_prefix(coin):
@@ -98,13 +102,11 @@ def best_pair_for_coin(delta_rate, pi42_rate, cs_rate):
 
 
 def run_scan_cycle():
-    print("  Fetching Delta (bulk)...")
+    """Runs one full 3-way scan across all COINS. Returns the list of
+    result rows (also logs them to CSV and sends any due Telegram alerts
+    as a side effect)."""
     delta_data = get_delta_funding_all()
-
-    print("  Fetching Pi42 (websocket batch, ~25s)...")
     pi42_data = get_pi42_funding_all(COINS)
-
-    print("  Fetching CoinSwitch (bulk, 1 call)...")
     try:
         cs_raw = get_all_funding_rates()
     except Exception as e:
@@ -113,6 +115,7 @@ def run_scan_cycle():
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rows = []
+    profitable_rows = []
 
     for coin in COINS:
         d = delta_data.get(coin)
@@ -129,6 +132,7 @@ def run_scan_cycle():
             continue  # fewer than 2 exchanges have this coin - skip
 
         pair_name, gap_pct, net_pct = best
+        profitable = net_pct > 0
         row = {
             "timestamp": now_str,
             "coin": coin,
@@ -138,34 +142,56 @@ def run_scan_cycle():
             "coinswitch_funding_pct": cs_rate * 100 if cs_rate is not None else "",
             "gap_pct": gap_pct,
             "net_pct": net_pct,
-            "profitable": net_pct > 0,
+            "profitable": profitable,
         }
         rows.append(row)
+        if profitable:
+            profitable_rows.append((row, delta_rate, pi42_rate, cs_rate))
 
     log_scan_to_csv(rows)
 
-    profitable_rows = [r for r in rows if r["profitable"]]
+    print(f"  Scanned {len(rows)} coins (had data for 2+ exchanges)")
+    print(f"  Profitable: {len(profitable_rows)}  |  CoinSwitch symbols this cycle: {len(cs_raw)}")
+
+    for row, delta_rate, pi42_rate, cs_rate in profitable_rows:
+        coin = row["coin"]
+        now = time.time()
+        last = _last_alert_time.get(coin, 0)
+        if now - last > PER_COIN_COOLDOWN_SECONDS:
+            print(f"    -> ALERT: {coin}  best={row['best_pair']}  net={row['net_pct']:+.4f}%")
+            send_three_way_opportunity_alert(
+                coin=coin,
+                pair_name=row["best_pair"],
+                gap_pct=row["gap_pct"],
+                net_pct=row["net_pct"],
+                delta_rate=delta_rate,
+                pi42_rate=pi42_rate,
+                coinswitch_rate=cs_rate,
+            )
+            _last_alert_time[coin] = now
+        else:
+            print(f"    -> {coin} profitable but in cooldown "
+                  f"({int((PER_COIN_COOLDOWN_SECONDS-(now-last))/60)}m left)")
+
     rows.sort(key=lambda r: r["net_pct"], reverse=True)
-
-    print(f"\n  Scanned {len(rows)} coins (had data for 2+ exchanges)")
-    print(f"  Profitable: {len(profitable_rows)}")
-    print(f"  CoinSwitch symbols available this cycle: {len(cs_raw)}")
-
-    print("\n  Top 10 by net%:")
-    for r in rows[:10]:
-        flag = "✅" if r["profitable"] else "  "
-        print(f"  {flag} {r['coin']:12s} best={r['best_pair']:18s} "
-              f"gap={r['gap_pct']:+.4f}%  net={r['net_pct']:+.4f}%")
-
     return rows
 
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  3-WAY FUNDING GAP SCANNER (Delta + Pi42 + CoinSwitch)")
-    print(f"  Scanning {len(COINS)} coins - single test cycle")
-    print("  Detection only. No orders placed. No Telegram alerts yet.")
+    print("  3-WAY FUNDING GAP MONITOR (Delta + Pi42 + CoinSwitch)")
+    print(f"  Scanning {len(COINS)} coins every {CYCLE_SECONDS}s")
+    print("  Detection + alerting only. No orders placed.")
     print("=" * 60)
-    run_scan_cycle()
-    print("\n  Done. Check the printed table above and the CSV log at:")
-    print("  /home/container/logs/three_way_scan_<date>.csv")
+
+    send_system_alert(f"3-way scanner started - watching {len(COINS)} coins across Delta/Pi42/CoinSwitch")
+
+    cycle = 0
+    while True:
+        cycle += 1
+        print(f"\n-- Scan cycle {cycle} - {time.strftime('%Y-%m-%d %H:%M:%S')} --")
+        try:
+            run_scan_cycle()
+        except Exception as e:
+            print(f"  [!] Scan cycle failed: {e}")
+        time.sleep(CYCLE_SECONDS)

@@ -3,6 +3,7 @@ import time
 import hmac
 import hashlib
 import json
+import threading
 from dotenv import load_dotenv
 import os
 
@@ -141,7 +142,38 @@ def place_delta_order(side, qty):
     return delta_post("/v2/orders", params)
 
 
-# ── Main loop ───────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════
+#  3-WAY SCANNER (Delta + Pi42 + CoinSwitch, 133 coins)
+#  Runs in a background thread alongside the BTC executor
+#  above. Detection + Telegram alerting only - never
+#  places orders. Added 2026-07-26; does not modify or
+#  interfere with the executor loop below in any way.
+# ══════════════════════════════════════════════════════
+
+def run_three_way_scanner_background():
+    try:
+        from src.execution.three_way_scanner import run_scan_cycle, CYCLE_SECONDS
+        from src.alerts.telegram import send_system_alert
+    except Exception as e:
+        print(f"  [3-WAY] Failed to load scanner module: {e}")
+        return
+
+    send_system_alert("3-way scanner started (background thread) - watching Delta/Pi42/CoinSwitch")
+    cycle = 0
+    while True:
+        cycle += 1
+        print(f"\n[3-WAY] -- Scan cycle {cycle} - {time.strftime('%Y-%m-%d %H:%M:%S')} --")
+        try:
+            run_scan_cycle()
+        except Exception as e:
+            print(f"  [3-WAY] Scan cycle failed: {e}")
+        time.sleep(CYCLE_SECONDS)
+
+
+threading.Thread(target=run_three_way_scanner_background, daemon=True).start()
+
+
+# ── Main loop (BTC-only executor - unchanged from before) ───────
 
 print("=" * 54)
 print(f"  FUNDING ARB EXECUTOR — {'PAPER MODE 📝' if PAPER_MODE else '🔴 LIVE MODE — REAL MONEY'}")

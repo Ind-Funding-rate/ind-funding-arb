@@ -66,6 +66,32 @@ def send_multi_opportunity_alert(coin: str, gap_pct: float, net_pct: float,
     )
     return send_telegram(message)
 
+# ── 3-WAY OPPORTUNITY ALERT (Delta + Pi42 + CoinSwitch scanner) ────
+def send_three_way_opportunity_alert(coin: str, pair_name: str,
+                                      gap_pct: float, net_pct: float,
+                                      delta_rate=None, pi42_rate=None,
+                                      coinswitch_rate=None):
+    """Send alert for the 3-way scanner. pair_name says which 2 exchanges
+    produced the winning gap (e.g. 'Delta-CoinSwitch'); whichever rates
+    are None (that exchange didn't have this coin) are shown as N/A."""
+    def fmt(rate):
+        return f"{rate*100:.4f}%" if rate is not None else "N/A"
+
+    message = (
+        f"🚨 <b>3-WAY ARB OPPORTUNITY: {coin}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏆 <b>Best pair</b>   : {pair_name}\n"
+        f"📈 <b>Delta</b>       : {fmt(delta_rate)}\n"
+        f"📉 <b>Pi42</b>        : {fmt(pi42_rate)}\n"
+        f"🔄 <b>CoinSwitch</b>  : {fmt(coinswitch_rate)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>GAP</b>         : {gap_pct:.4f} pp\n"
+        f"💰 <b>NET PROFIT</b>  : +{net_pct:.4f}%\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    return send_telegram(message)
+
 # ── SYSTEM ALERT ──────────────────────────────────────────────
 def send_system_alert(message: str):
     """Send a system status alert."""

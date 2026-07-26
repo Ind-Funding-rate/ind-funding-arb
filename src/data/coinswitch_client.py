@@ -25,7 +25,10 @@ import time
 import requests
 import os
 from urllib.parse import urlencode
+from dotenv import load_dotenv
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+load_dotenv("/home/container/.env")
 
 BASE_URL = "https://coinswitch.co"
 
@@ -35,6 +38,12 @@ def _sign_request(method: str, path: str, params: dict = None):
     (headers, full_path_with_query) ready to use in a requests call."""
     api_key = os.getenv("COINSWITCH_API_KEY")
     secret_key_hex = os.getenv("COINSWITCH_SECRET_KEY")
+
+    if not api_key or not secret_key_hex:
+        raise RuntimeError(
+            "COINSWITCH_API_KEY or COINSWITCH_SECRET_KEY not found in .env - "
+            "check they're set at /home/container/.env"
+        )
 
     query_string = urlencode(params) if params else ""
     path_with_query = f"{path}?{query_string}" if query_string else path
@@ -78,6 +87,8 @@ def get_all_funding_rates():
 if __name__ == "__main__":
     # Quick manual test - confirms real credentials + real data, not a mock
     print("Testing CoinSwitch futures ticker fetch...")
+    print(f"API key loaded: {'yes' if os.getenv('COINSWITCH_API_KEY') else 'NO - check .env'}")
+    print(f"Secret loaded:   {'yes' if os.getenv('COINSWITCH_SECRET_KEY') else 'NO - check .env'}")
     rates = get_all_funding_rates()
     print(f"Got {len(rates)} symbols")
     if "BTCUSDT" in rates:

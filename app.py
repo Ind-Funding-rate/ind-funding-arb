@@ -4,8 +4,12 @@ import hmac
 import hashlib
 import json
 import threading
+import sys
 import os
+from pathlib import Path
 from dotenv import load_dotenv
+
+sys.path.append(str(Path(__file__).resolve().parent))
 
 load_dotenv("/home/container/bot/.env")
 
@@ -31,29 +35,7 @@ DELTA_FEE   = 0.050 * 1.18 / 100   # 0.05900%
 ROUND_TRIP  = 2 * (PI42_FEE + DELTA_FEE)  # 4 trades: open+close on both exchanges
 
 
-# ── Helpers ──────────────────────────────────────────────────
-
-def delta_get(path):
-    ts  = str(int(time.time()))
-    sig = hmac.new(DELTA_SECRET.encode(), ("GET" + ts + path).encode(), hashlib.sha256).hexdigest()
-    r   = requests.get(
-        f"https://api.india.delta.exchange{path}",
-        headers={"api-key": DELTA_KEY, "timestamp": ts, "signature": sig,
-                 "Content-Type": "application/json"},
-        timeout=10
-    )
-    return r.json()
-
-def pi42_get(path, extra_qs=""):
-    ts  = str(int(time.time() * 1000))
-    qs  = f"timestamp={ts}{extra_qs}"
-    sig = hmac.new(PI42_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
-    r   = requests.get(
-        f"https://fapi.pi42.com{path}?{qs}",
-        headers={"api-key": PI42_KEY, "signature": sig},
-        timeout=10
-    )
-    return r.json()
+# ── Order placement helpers (Delta/Pi42 signed REST calls) ──────
 
 def pi42_post(path, params):
     ts = str(int(time.time() * 1000))
@@ -84,24 +66,34 @@ def delta_post(path, params):
 
 
 # ── Fetch live rates ─────────────────────────────────────────
+# 2026-07-27: this used to have its own separate Delta/Pi42 REST calls
+# here, with two confirmed bugs - Delta's funding_rate was displayed
+# 100x too high (missing the /100 conversion that the proven scanner
+# code applies), and Pi42's REST endpoint returned entirely empty data
+# (0.00 for both price and funding). Now reuses get_delta_funding_all()
+# and get_pi42_funding_all() from full_market_scanner.py, the same
+# functions already proven correct and running live in the scanner and
+# website for months - just pulls out the "BTC" entry from each.
+
+from src.execution.full_market_scanner import get_delta_funding_all, get_pi42_funding_all
+
 
 def get_rates():
     rates = {}
     try:
-        r = requests.get(
-            "https://api.india.delta.exchange/v2/tickers/BTCUSD", timeout=10
-        ).json()
-        t = r.get("result", {})
-        rates["delta_price"]   = float(t.get("mark_price", 0))
-        rates["delta_funding"] = float(t.get("funding_rate", 0))
+        delta_data = get_delta_funding_all()
+        btc = delta_data.get("BTC")
+        if btc:
+            rates["delta_price"]   = btc["price"]
+            rates["delta_funding"] = btc["funding"]
     except Exception as e:
         print(f"  [!] Delta rate fetch failed: {e}")
     try:
-        r = requests.get(
-            "https://api.pi42.com/v1/market/ticker24Hr/BTCINR", timeout=10
-        ).json()
-        rates["pi42_price"]   = float(r.get("lastPrice", 0))
-        rates["pi42_funding"] = float(r.get("fundingRate", 0))
+        pi42_data = get_pi42_funding_all(["BTC"])
+        btc = pi42_data.get("BTC")
+        if btc:
+            rates["pi42_price"]   = btc["price"]
+            rates["pi42_funding"] = btc["funding"]
     except Exception as e:
         print(f"  [!] Pi42 rate fetch failed: {e}")
     return rates
@@ -149,14 +141,6 @@ def place_delta_order(side, qty):
 #  backtest, global backtest, opportunity matrix) in this same
 #  process, in background threads, alongside the BTC executor
 #  loop below.
-#
-#  2026-07-26: previously the 3-way scanner ran as its OWN
-#  separate background thread directly in this file (duplicate
-#  work - the website below already runs it internally to feed
-#  its own pages, incl. Telegram alerting which lives inside
-#  three_way_scanner.run_scan_cycle() itself). That duplicate
-#  thread has been removed here to avoid running the same scan
-#  twice per cycle and wasting CoinSwitch's rate limit.
 # ══════════════════════════════════════════════════════
 
 def run_website_background():
@@ -185,7 +169,7 @@ def run_website_background():
 threading.Thread(target=run_website_background, daemon=True).start()
 
 
-# ── Main loop (BTC-only executor - unchanged from before) ───────
+# ── Main loop (BTC-only executor) ────────────────────────────────
 
 print("=" * 54)
 print(f"  FUNDING ARB EXECUTOR — {'PAPER MODE 📝' if PAPER_MODE else '🔴 LIVE MODE — REAL MONEY'}")
@@ -199,11 +183,11 @@ while True:
 
     rates = get_rates()
 
-    if not rates.get("delta_funding") and rates.get("delta_funding") != 0:
+    if "delta_funding" not in rates:
         print("  Waiting for Delta data...")
         time.sleep(30)
         continue
-    if not rates.get("pi42_funding") and rates.get("pi42_funding") != 0:
+    if "pi42_funding" not in rates:
         print("  Waiting for Pi42 data...")
         time.sleep(30)
         continue

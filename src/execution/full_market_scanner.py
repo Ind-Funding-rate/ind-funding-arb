@@ -12,6 +12,16 @@ This does NOT place any orders - detection and alerting only.
 run_scan_cycle() returns the scanned rows so other code (e.g. the web
 dashboard) can display the same live results without duplicating the
 fetch/compute logic or hitting the exchanges twice.
+
+2026-07-27: get_delta_funding_all() and get_pi42_funding_all() now also
+return "price" (in addition to "funding") for every coin. This was added
+so the standalone BTC-only executor (root app.py) can stop using its own
+separate, buggy rate-fetching code and reuse these already-proven
+functions instead - it was found to be treating Delta's funding_rate as
+a fraction instead of dividing by 100 first (showing 1.00% instead of the
+real ~0.01%), and its Pi42 REST call was returning empty data entirely.
+Purely additive change - existing "funding"/"volume_usd" keys and their
+meaning are unchanged, so nothing that already reads this data breaks.
 """
 import requests
 import time
@@ -87,10 +97,12 @@ def get_delta_funding_all():
             base = symbol[:-3]
             raw = t.get("funding_rate")
             vol = t.get("turnover_usd") or t.get("volume")
+            price = t.get("mark_price") or t.get("spot_price") or t.get("close")
             if raw is not None:
                 out[base] = {
                     "funding": float(raw) / 100,
                     "volume_usd": float(vol) if vol else 0,
+                    "price": float(price) if price else 0,
                 }
     return out
 
@@ -124,7 +136,16 @@ async def _pi42_ws_batch(symbols):
                 if sym.endswith("INR"):
                     base = sym[:-3]
                     if base not in results:
-                        results[base] = {"funding": float(data.get("r", 0))}
+                        # "p" is the mark price field name in this payload
+                        # (same Binance-style convention as "s" for symbol
+                        # and "r" for rate, used elsewhere in this same
+                        # message) - verify against a printed value before
+                        # trusting for anything beyond display/logging.
+                        raw_price = data.get("p", data.get("markPrice", 0))
+                        results[base] = {
+                            "funding": float(data.get("r", 0)),
+                            "price": float(raw_price) if raw_price else 0,
+                        }
     return results
 
 

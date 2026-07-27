@@ -4,8 +4,8 @@ import hmac
 import hashlib
 import json
 import threading
-from dotenv import load_dotenv
 import os
+from dotenv import load_dotenv
 
 load_dotenv("/home/container/bot/.env")
 
@@ -143,34 +143,46 @@ def place_delta_order(side, qty):
 
 
 # ══════════════════════════════════════════════════════
-#  3-WAY SCANNER (Delta + Pi42 + CoinSwitch, 133 coins)
-#  Runs in a background thread alongside the BTC executor
-#  above. Detection + Telegram alerting only - never
-#  places orders. Added 2026-07-26; does not modify or
-#  interfere with the executor loop below in any way.
+#  WEBSITE (background) - src/web/app.py
+#  Runs the full Flask dashboard (8 pages: live scanner,
+#  3-way scanner w/ CoinSwitch, Indian exchanges/opportunities/
+#  backtest, global backtest, opportunity matrix) in this same
+#  process, in background threads, alongside the BTC executor
+#  loop below.
+#
+#  2026-07-26: previously the 3-way scanner ran as its OWN
+#  separate background thread directly in this file (duplicate
+#  work - the website below already runs it internally to feed
+#  its own pages, incl. Telegram alerting which lives inside
+#  three_way_scanner.run_scan_cycle() itself). That duplicate
+#  thread has been removed here to avoid running the same scan
+#  twice per cycle and wasting CoinSwitch's rate limit.
 # ══════════════════════════════════════════════════════
 
-def run_three_way_scanner_background():
+def run_website_background():
     try:
-        from src.execution.three_way_scanner import run_scan_cycle, CYCLE_SECONDS
-        from src.alerts.telegram import send_system_alert
+        from src.web.app import (
+            app as flask_app,
+            background_scanner,
+            background_three_way_scanner,
+            ingestion_background,
+            ranking_background,
+        )
     except Exception as e:
-        print(f"  [3-WAY] Failed to load scanner module: {e}")
+        print(f"  [WEB] Failed to load website module: {e}")
         return
 
-    send_system_alert("3-way scanner started (background thread) - watching Delta/Pi42/CoinSwitch")
-    cycle = 0
-    while True:
-        cycle += 1
-        print(f"\n[3-WAY] -- Scan cycle {cycle} - {time.strftime('%Y-%m-%d %H:%M:%S')} --")
-        try:
-            run_scan_cycle()
-        except Exception as e:
-            print(f"  [3-WAY] Scan cycle failed: {e}")
-        time.sleep(CYCLE_SECONDS)
+    threading.Thread(target=background_scanner, daemon=True).start()
+    threading.Thread(target=background_three_way_scanner, daemon=True).start()
+    threading.Thread(target=ingestion_background, daemon=True).start()
+    threading.Thread(target=ranking_background, daemon=True).start()
+
+    port = int(os.getenv("SERVER_PORT", 8080))
+    print(f"  [WEB] Starting dashboard on 0.0.0.0:{port}")
+    flask_app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)
 
 
-threading.Thread(target=run_three_way_scanner_background, daemon=True).start()
+threading.Thread(target=run_website_background, daemon=True).start()
 
 
 # ── Main loop (BTC-only executor - unchanged from before) ───────

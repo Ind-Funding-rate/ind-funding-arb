@@ -14,19 +14,12 @@ on 2+ exchanges", every raw symbol is reduced to a CANONICAL name first
 name - while still remembering each exchange's own RAW symbol, since
 that's what's actually needed to call each exchange's API.
 
-2026-07-29 fix: get_pi42_all_symbols() was reading a field called
-"contractPair" from Pi42's exchangeInfo response, which does not exist -
-Pi42's actual field name is "name" (e.g. "BTCINR"), confirmed directly
-from a real response earlier in this project. The wrong key meant
-.get(...) always returned "", so pi42_raw was silently empty every run
-(0 symbols) - Pi42 contributed nothing to the merged universe even
-though Delta and CoinSwitch worked fine. Fixed to read "name", matching
-both the real API response and the INR-suffix convention already used
-by the proven, working Pi42 fetch in full_market_scanner.py.
-
-Standalone and read-only. Does not modify full_market_scanner.py or
-three_way_scanner.py yet - run this first, confirm the numbers look
-right, then it gets wired in as a second step.
+Field name note: two different sessions disagreed on whether Pi42's
+exchangeInfo contract objects use "contractPair" or "name" for the
+symbol (e.g. "BTCINR"). Rather than trust either claim, get_pi42_all_symbols()
+below checks both and prints which one it actually found on the live
+API, the first time it runs each process - so this is settled by real
+data, not by either AI's memory of a previous session.
 """
 import re
 import sys
@@ -38,6 +31,7 @@ from src.execution.full_market_scanner import get_delta_funding_all
 from src.data.coinswitch_client import get_all_funding_rates
 
 _MULTIPLIER_PREFIX = re.compile(r"^(1000|1M)")
+_pi42_field_logged = False
 
 
 def canonical(raw_coin):
@@ -49,35 +43,54 @@ def get_pi42_all_symbols():
     """Full list of Pi42's own INR-margined perpetual contracts, straight
     from their exchangeInfo endpoint - not the websocket (which needs you
     to already know what to subscribe to)."""
+    global _pi42_field_logged
+
     r = requests.get(
         "https://api.pi42.com/v1/exchange/exchangeInfo", params={"market": "INR"}, timeout=15
     )
     r.raise_for_status()
     contracts = r.json().get("contracts", [])
+
+    if contracts and not _pi42_field_logged:
+        sample = contracts[0]
+        print(f"  [debug] Pi42 contract object keys: {list(sample.keys())}")
+        _pi42_field_logged = True
+
     out = []
     for c in contracts:
-        pair = c.get("name", "")
+        # Try both field names seen across different sessions - use
+        # whichever is actually present rather than assuming one.
+        pair = c.get("name") or c.get("contractPair") or ""
         if pair.endswith("INR"):
             out.append(pair[:-3])  # 'BTCINR' -> 'BTC'
     return out
 
 
-def build_coin_universe():
+def build_coin_universe(delta_raw=None, pi42_raw=None, cs_symbols=None):
     """
     Returns a dict: {canonical_coin: {"delta": raw_symbol_or_None,
     "pi42": raw_symbol_or_None, "coinswitch": raw_symbol_or_None,
     "exchange_count": int}} - filtered to only coins present on 2 or
     more exchanges.
+
+    Callers that already fetched Delta/CoinSwitch data this cycle (for
+    funding rates) should pass delta_raw=list(delta_data.keys()) and
+    cs_symbols=list(cs_data.keys()) to avoid fetching the same data
+    twice. pi42_raw (list of Pi42's own raw base coin names) is always
+    fetched fresh here since nothing else needs Pi42's exchangeInfo.
     """
-    print("  Fetching Delta's full symbol list...")
-    delta_raw = list(get_delta_funding_all().keys())  # already the base coin, e.g. 'BTC', '1000BONK'
+    if delta_raw is None:
+        print("  Fetching Delta's full symbol list...")
+        delta_raw = list(get_delta_funding_all().keys())
 
-    print("  Fetching Pi42's full symbol list...")
-    pi42_raw = get_pi42_all_symbols()
+    if pi42_raw is None:
+        print("  Fetching Pi42's full symbol list...")
+        pi42_raw = get_pi42_all_symbols()
 
-    print("  Fetching CoinSwitch's full symbol list...")
-    cs_data = get_all_funding_rates()
-    cs_raw = [sym[:-4] for sym in cs_data.keys() if sym.endswith("USDT")]  # 'BTCUSDT' -> 'BTC'
+    if cs_symbols is None:
+        print("  Fetching CoinSwitch's full symbol list...")
+        cs_symbols = list(get_all_funding_rates().keys())
+    cs_raw = [sym[:-4] for sym in cs_symbols if sym.endswith("USDT")]  # 'BTCUSDT' -> 'BTC'
 
     print(f"  Delta: {len(delta_raw)} symbols | Pi42: {len(pi42_raw)} symbols | "
           f"CoinSwitch: {len(cs_raw)} symbols")
@@ -120,8 +133,6 @@ if __name__ == "__main__":
     print(f"    On all 3 exchanges : {len(all_3)}")
     print(f"    On exactly 2       : {len(exactly_2)}")
 
-    # Break down which PAIR of exchanges for the "exactly 2" group -
-    # useful to sanity-check nothing looks obviously wrong
     dp = sum(1 for c in exactly_2 if universe[c]["delta"] and universe[c]["pi42"])
     dc = sum(1 for c in exactly_2 if universe[c]["delta"] and universe[c]["coinswitch"])
     pc = sum(1 for c in exactly_2 if universe[c]["pi42"] and universe[c]["coinswitch"])

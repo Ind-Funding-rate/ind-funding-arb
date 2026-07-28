@@ -6,8 +6,8 @@ touch that file, its CSV logs, its Telegram alerts, or the website -
 all of that keeps working exactly as before, completely separate from
 this.
 
-For every coin, fetches funding rates from all 3 exchanges (where
-available) and checks all 3 possible pairs:
+For every coin on 2+ of the 3 exchanges, fetches funding rates and
+checks all 3 possible pairs:
     Delta <-> Pi42
     Delta <-> CoinSwitch
     Pi42  <-> CoinSwitch
@@ -17,15 +17,19 @@ spam Telegram every cycle.
 
 Detection/logging/alerting only - places NO orders.
 
-FEE CORRECTION (2026-07-26): the previous version assumed CoinSwitch
-charges the same 18% GST as Delta/Pi42. Checked 5+ independent CoinSwitch
-fee-review sources directly - none mention GST for CoinSwitch specifically
-(unlike Pi42, where GST is explicitly and repeatedly documented on their
-own fee page). Corrected to a flat 0.05% taker fee, no GST assumption,
-since that's what the evidence actually supports. If CoinSwitch does add
-GST later, this constant is the one place to update.
+FEE NOTE (2026-07-26): CoinSwitch fee below is a flat 0.05% taker with
+no GST, checked against 5+ independent CoinSwitch fee sources (none
+mention GST for CoinSwitch specifically, unlike Pi42's own fee page
+which documents it explicitly). If CoinSwitch adds GST later, this
+constant is the one place to update.
+
+COIN COVERAGE (2026-07-28): previously used a fixed 133-coin list (the
+old Delta-Pi42 intersection, never accounted for CoinSwitch at all).
+Now uses coin_universe.build_coin_universe() to auto-discover every
+coin on 2+ of the 3 exchanges each cycle - confirmed 306 coins this
+way (vs the old 133), reusing Delta/CoinSwitch data already fetched
+this cycle rather than fetching it twice.
 """
-import re
 import sys
 import csv
 import time
@@ -33,15 +37,14 @@ from pathlib import Path
 from datetime import datetime
 
 sys.path.append(str(Path(__file__).resolve().parents[2]))
-from src.execution.full_market_scanner import (
-    COINS, get_delta_funding_all, get_pi42_funding_all,
-)
+from src.execution.full_market_scanner import get_delta_funding_all, get_pi42_funding_all
 from src.data.coinswitch_client import get_all_funding_rates
+from src.data.coin_universe import build_coin_universe
 from src.alerts.telegram import send_three_way_opportunity_alert, send_system_alert
 
 PI42_FEE       = 0.080 * 1.18 / 100   # 0.0944% - taker + 18% GST, confirmed on Pi42's own fee page
 DELTA_FEE      = 0.050 * 1.18 / 100   # 0.0590% - taker + 18% GST, confirmed on Delta's own fee page
-COINSWITCH_FEE = 0.050 / 100          # 0.0500% - taker, no GST (checked 5+ independent sources, none mention GST for CoinSwitch)
+COINSWITCH_FEE = 0.050 / 100          # 0.0500% - taker, no GST (checked 5+ independent sources)
 
 ROUND_TRIP = {
     "Delta-Pi42":       2 * (DELTA_FEE + PI42_FEE),
@@ -55,15 +58,7 @@ PER_COIN_COOLDOWN_SECONDS = 30 * 60
 LOG_DIR = Path("/home/container/logs")
 LOG_DIR.mkdir(exist_ok=True)
 
-_MULTIPLIER_PREFIX = re.compile(r"^(1000|1M)")
 _last_alert_time = {}
-
-
-def strip_multiplier_prefix(coin):
-    """'1000BONK' -> 'BONK', '1MBABYDOGE' -> 'BABYDOGE', 'BTC' -> 'BTC'.
-    Delta/Pi42 use the multiplier prefix in their symbol names; CoinSwitch
-    does not."""
-    return _MULTIPLIER_PREFIX.sub("", coin)
 
 
 def log_scan_to_csv(rows):
@@ -105,26 +100,34 @@ def best_pair_for_coin(delta_rate, pi42_rate, cs_rate):
 
 
 def run_scan_cycle():
-    """Runs one full 3-way scan across all COINS. Returns the list of
-    result rows (also logs them to CSV and sends any due Telegram alerts
-    as a side effect)."""
+    """Runs one full 3-way scan across the auto-discovered coin universe
+    (coins on 2+ of the 3 exchanges). Returns the list of result rows
+    (also logs them to CSV and sends any due Telegram alerts as a side
+    effect)."""
     delta_data = get_delta_funding_all()
-    pi42_data = get_pi42_funding_all(COINS)
     try:
         cs_raw = get_all_funding_rates()
     except Exception as e:
         print(f"  [!] CoinSwitch fetch failed: {e}")
         cs_raw = {}
 
+    universe = build_coin_universe(
+        delta_raw=list(delta_data.keys()),
+        cs_symbols=list(cs_raw.keys()),
+    )
+    print(f"  Coin universe this cycle: {len(universe)} coins on 2+ exchanges")
+
+    pi42_symbols_needed = [v["pi42"] for v in universe.values() if v["pi42"]]
+    pi42_data = get_pi42_funding_all(pi42_symbols_needed)
+
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rows = []
     profitable_rows = []
 
-    for coin in COINS:
-        d = delta_data.get(coin)
-        p = pi42_data.get(coin)
-        cs_symbol = strip_multiplier_prefix(coin) + "USDT"
-        c = cs_raw.get(cs_symbol)
+    for coin, sources in universe.items():
+        d = delta_data.get(sources["delta"]) if sources["delta"] else None
+        p = pi42_data.get(sources["pi42"]) if sources["pi42"] else None
+        c = cs_raw.get(sources["coinswitch"] + "USDT") if sources["coinswitch"] else None
 
         delta_rate = d["funding"] if d else None
         pi42_rate = p["funding"] if p else None
@@ -132,7 +135,7 @@ def run_scan_cycle():
 
         best = best_pair_for_coin(delta_rate, pi42_rate, cs_rate)
         if best is None:
-            continue  # fewer than 2 exchanges have this coin - skip
+            continue  # fewer than 2 exchanges actually returned data this cycle - skip
 
         pair_name, gap_pct, net_pct = best
         profitable = net_pct > 0
@@ -153,7 +156,7 @@ def run_scan_cycle():
 
     log_scan_to_csv(rows)
 
-    print(f"  Scanned {len(rows)} coins (had data for 2+ exchanges)")
+    print(f"  Scanned {len(rows)} coins (had live data for 2+ exchanges this cycle)")
     print(f"  Profitable: {len(profitable_rows)}  |  CoinSwitch symbols this cycle: {len(cs_raw)}")
 
     for row, delta_rate, pi42_rate, cs_rate in profitable_rows:
@@ -183,11 +186,11 @@ def run_scan_cycle():
 if __name__ == "__main__":
     print("=" * 60)
     print("  3-WAY FUNDING GAP MONITOR (Delta + Pi42 + CoinSwitch)")
-    print(f"  Scanning {len(COINS)} coins every {CYCLE_SECONDS}s")
+    print(f"  Auto-discovering coin universe (2+ of 3 exchanges) every {CYCLE_SECONDS}s")
     print("  Detection + alerting only. No orders placed.")
     print("=" * 60)
 
-    send_system_alert(f"3-way scanner started - watching {len(COINS)} coins across Delta/Pi42/CoinSwitch")
+    send_system_alert("3-way scanner started - auto-discovering coins across Delta/Pi42/CoinSwitch")
 
     cycle = 0
     while True:

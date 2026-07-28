@@ -22,6 +22,17 @@ a fraction instead of dividing by 100 first (showing 1.00% instead of the
 real ~0.01%), and its Pi42 REST call was returning empty data entirely.
 Purely additive change - existing "funding"/"volume_usd" keys and their
 meaning are unchanged, so nothing that already reads this data breaks.
+
+2026-07-28: Pi42 batch fetch had two related issues, found once the
+3-way scanner started subscribing to ~250+ symbols (up from 133) via
+coin_universe's auto-discovery - a fixed 25s window wasn't always enough
+time for Pi42 to push at least one update for every subscribed symbol,
+so coverage varied wildly cycle to cycle (300 coins one cycle, 129 the
+next, purely due to timing). Separately, the per-message recv() timeout
+was always a flat 25s instead of the REMAINING time left in the window,
+which could let a single slow message push the whole function well past
+its intended time budget. Both fixed below: window increased to 45s,
+and the per-message timeout now uses actual remaining time.
 """
 import requests
 import time
@@ -45,6 +56,7 @@ DELTA_FEE  = 0.050 * 1.18 / 100
 ROUND_TRIP = 2 * (PI42_FEE + DELTA_FEE)
 
 PI42_WS_URL = "wss://fawss.pi42.com/socket.io/?EIO=4&transport=websocket"
+PI42_WS_WINDOW_SECONDS = 45  # was 25 - too short once coin universe grew past 133 symbols
 
 CYCLE_SECONDS = 90
 PER_COIN_COOLDOWN_SECONDS = 30 * 60
@@ -117,10 +129,16 @@ async def _pi42_ws_batch(symbols):
         sub_msg = f'42["subscribe", {{"params": {json.dumps(channels)}}}]'
         await ws.send(sub_msg)
 
-        end_time = asyncio.get_event_loop().time() + 25
-        while asyncio.get_event_loop().time() < end_time and len(results) < len(symbols):
+        end_time = asyncio.get_event_loop().time() + PI42_WS_WINDOW_SECONDS
+        while len(results) < len(symbols):
+            remaining = end_time - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                break
             try:
-                msg = await asyncio.wait_for(ws.recv(), timeout=25)
+                # was a flat 25s regardless of how much of the window was
+                # already used - now scoped to actual time left, so this
+                # function can't run meaningfully longer than the window
+                msg = await asyncio.wait_for(ws.recv(), timeout=remaining)
             except asyncio.TimeoutError:
                 break
             if msg == "2":

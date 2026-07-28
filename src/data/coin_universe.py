@@ -14,6 +14,16 @@ on 2+ exchanges", every raw symbol is reduced to a CANONICAL name first
 name - while still remembering each exchange's own RAW symbol, since
 that's what's actually needed to call each exchange's API.
 
+2026-07-29 fix: get_pi42_all_symbols() was reading a field called
+"contractPair" from Pi42's exchangeInfo response, which does not exist -
+Pi42's actual field name is "name" (e.g. "BTCINR"), confirmed directly
+from a real response earlier in this project. The wrong key meant
+.get(...) always returned "", so pi42_raw was silently empty every run
+(0 symbols) - Pi42 contributed nothing to the merged universe even
+though Delta and CoinSwitch worked fine. Fixed to read "name", matching
+both the real API response and the INR-suffix convention already used
+by the proven, working Pi42 fetch in full_market_scanner.py.
+
 Standalone and read-only. Does not modify full_market_scanner.py or
 three_way_scanner.py yet - run this first, confirm the numbers look
 right, then it gets wired in as a second step.
@@ -46,7 +56,7 @@ def get_pi42_all_symbols():
     contracts = r.json().get("contracts", [])
     out = []
     for c in contracts:
-        pair = c.get("contractPair", "")
+        pair = c.get("name", "")
         if pair.endswith("INR"):
             out.append(pair[:-3])  # 'BTCINR' -> 'BTC'
     return out

@@ -18,6 +18,13 @@ scanner's data (Delta+Pi42+CoinSwitch) instead of the old Delta/Pi42-only
 feed, and a new "Indian Backtest" page reads from the 3-way scanner's own
 CSV logs - both were pointed at the wrong/incomplete data source before.
 
+2026-07-28 update: visual redesign (Loris Tools-inspired dark terminal
+style - JetBrains Mono for numbers, functional heatmap colors, spread
+bars on the Scanner and Indian Opportunities pages). Purely CSS/display
+layer - BASE_CSS is the single shared style block every page's {css}
+placeholder pulls from, so this cascades everywhere from one place. No
+backend/data logic below this point was touched.
+
 Binds to whatever port HidenCloud/Pterodactyl assigns via the SERVER_PORT
 env var (falls back to 8080 if not set, for local testing).
 """
@@ -195,66 +202,115 @@ def ranking_background():
 
 
 # ── SHARED PAGE STYLE ────────────────────────────────────────
+# Loris Tools-inspired dark terminal theme: JetBrains Mono for all
+# numeric data (fixed-width so decimal points align down a column),
+# Inter for labels/nav, functional heatmap colors (not decorative -
+# green/red/amber carry real meaning about profitability).
 BASE_CSS = """
-  :root { color-scheme: dark; }
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&display=swap');
+  :root {
+    color-scheme: dark;
+    --bg: #0B0E11;
+    --panel: #12161C;
+    --row: #151920;
+    --row-alt: #12151B;
+    --border: #1E2530;
+    --border-soft: #191E27;
+    --text: #F4F6FA;
+    --muted: #6B7385;
+    --muted-2: #8B92A8;
+    --profit: #00D084;
+    --profit-dim: #0A2E22;
+    --loss: #FF4757;
+    --loss-dim: #2E1418;
+    --near: #FFB020;
+    --near-dim: #2E2410;
+    --accent: #3B82F6;
+  }
   * { box-sizing: border-box; }
-  body { font-family: -apple-system, system-ui, sans-serif; background:#0f1117;
-         color:#e6e6e6; margin:0; padding:0 16px 40px; }
-  header { display:flex; gap:18px; align-items:center; padding:16px 0;
-           border-bottom:1px solid #2a2d38; margin-bottom:20px; flex-wrap:wrap; }
-  header a { color:#e6e6e6; text-decoration:none; font-weight:600; opacity:.7; font-size:14px; }
-  header a.active { opacity:1; border-bottom:2px solid #4ade80; padding-bottom:14px; }
-  h1 { font-size:20px; margin:0 20px 0 0; }
-  table { width:100%; border-collapse:collapse; font-size:14px; }
-  th, td { text-align:right; padding:8px 10px; border-bottom:1px solid #1f222c; }
-  th { color:#8b8fa3; font-weight:600; position:sticky; top:0; background:#0f1117;
+  body { font-family: 'Inter', -apple-system, system-ui, sans-serif; background:var(--bg);
+         color:var(--text); margin:0; padding:0 18px 48px; font-size:14px; }
+  header { display:flex; gap:22px; align-items:center; padding:18px 0;
+           border-bottom:1px solid var(--border); margin-bottom:22px; flex-wrap:wrap; }
+  header a { color:var(--muted-2); text-decoration:none; font-weight:600; font-size:13px;
+             letter-spacing:.01em; padding-bottom:16px; border-bottom:2px solid transparent;
+             transition:color .15s; }
+  header a:hover { color:var(--text); }
+  header a.active { color:var(--text); border-bottom-color:var(--profit); }
+  h1 { font-size:17px; margin:0 24px 0 0; font-weight:800; letter-spacing:-.01em; }
+  h2 { font-weight:800; letter-spacing:-.01em; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:right; padding:10px 12px; border-bottom:1px solid var(--border-soft); }
+  th { color:var(--muted); font-weight:700; font-size:10.5px; letter-spacing:.08em;
+       text-transform:uppercase; position:sticky; top:0; background:var(--bg);
        cursor:pointer; user-select:none; }
-  th:hover { color:#e6e6e6; }
+  th:hover { color:var(--text); }
   td:first-child, th:first-child { text-align:left; }
-  .profit { color:#4ade80; font-weight:600; }
-  .loss { color:#8b8fa3; }
-  .near { color:#facc15; font-weight:600; }
-  .thin { display:inline-block; background:#3f2d0e; color:#facc15; font-size:10px;
-          padding:1px 5px; border-radius:4px; margin-left:6px; vertical-align:middle; }
-  .meta { color:#8b8fa3; font-size:13px; margin-bottom:14px; }
+  tbody tr:hover { background:var(--row); }
+  td { font-family:'JetBrains Mono', monospace; font-variant-numeric:tabular-nums; }
+  td:first-child { font-family:'Inter', sans-serif; font-weight:600; }
+  .profit { color:var(--profit); font-weight:600; }
+  .loss { color:var(--muted); }
+  .near { color:var(--near); font-weight:600; }
+  .thin { display:inline-block; background:var(--near-dim); color:var(--near);
+          font-family:'Inter',sans-serif; font-size:9.5px; font-weight:700;
+          padding:2px 6px; border-radius:4px; margin-left:6px; vertical-align:middle;
+          letter-spacing:.03em; text-transform:uppercase; }
+  .meta { color:var(--muted-2); font-size:12.5px; margin-bottom:16px;
+          font-family:'JetBrains Mono', monospace; }
   #search { width:100%; max-width:280px; margin-bottom:14px; }
   form { display:flex; gap:10px; flex-wrap:wrap; align-items:end; margin-bottom:24px; }
-  label { display:block; font-size:12px; color:#8b8fa3; margin-bottom:4px; }
-  input, select { background:#1a1d27; border:1px solid #2a2d38; color:#e6e6e6;
-                  padding:8px 10px; border-radius:6px; font-size:14px; }
-  button { background:#4ade80; color:#0f1117; border:none; padding:9px 18px;
-           border-radius:6px; font-weight:700; cursor:pointer; }
-  button.secondary { background:#2a2d38; color:#e6e6e6; }
-  .card { background:#1a1d27; border:1px solid #2a2d38; border-radius:10px;
-          padding:18px; max-width:520px; }
-  .card p { display:flex; justify-content:space-between; margin:8px 0;
-            font-size:14px; border-bottom:1px dashed #2a2d38; padding-bottom:8px; }
-  .card p span:first-child { color:#8b8fa3; }
-  .note { color:#8b8fa3; font-size:12px; margin-top:16px; line-height:1.5; }
-  a.coin-link { color:#e6e6e6; text-decoration:underline dotted; }
+  label { display:block; font-size:10.5px; color:var(--muted); margin-bottom:5px;
+          font-weight:700; letter-spacing:.06em; text-transform:uppercase; }
+  input, select { background:var(--panel); border:1px solid var(--border); color:var(--text);
+                  padding:9px 11px; border-radius:6px; font-size:13px;
+                  font-family:'JetBrains Mono', monospace; }
+  input:focus, select:focus { outline:none; border-color:var(--accent); }
+  button { background:var(--profit); color:#04120C; border:none; padding:10px 20px;
+           border-radius:6px; font-weight:700; cursor:pointer; font-size:13px;
+           font-family:'Inter',sans-serif; }
+  button:hover { filter:brightness(1.1); }
+  button.secondary { background:var(--panel); color:var(--text); border:1px solid var(--border); }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:10px;
+          padding:20px; max-width:520px; }
+  .card p { display:flex; justify-content:space-between; margin:9px 0;
+            font-size:13.5px; border-bottom:1px dashed var(--border-soft); padding-bottom:9px; }
+  .card p span:first-child { color:var(--muted-2); font-weight:600; }
+  .card p span:last-child { font-family:'JetBrains Mono', monospace; font-variant-numeric:tabular-nums; }
+  .note { color:var(--muted-2); font-size:12px; margin-top:16px; line-height:1.6; }
+  a.coin-link { color:var(--text); text-decoration:none; border-bottom:1px dotted var(--muted); }
+  a.coin-link:hover { border-bottom-color:var(--accent); color:var(--accent); }
   .autocomplete-wrap { position:relative; }
   .autocomplete-list { position:absolute; top:100%; left:0; right:0; z-index:20;
-                        background:#1a1d27; border:1px solid #2a2d38; border-top:none;
+                        background:var(--panel); border:1px solid var(--border); border-top:none;
                         border-radius:0 0 6px 6px; max-height:220px; overflow-y:auto;
                         display:none; }
-  .autocomplete-list div { padding:8px 10px; cursor:pointer; text-align:left; font-size:14px; }
-  .autocomplete-list div:hover, .autocomplete-list div.active-item { background:#2a2d38; }
-  .stat-cards { display:flex; gap:14px; flex-wrap:wrap; margin-bottom:24px; }
-  .stat-card { background:#1a1d27; border:1px solid #2a2d38; border-radius:10px;
-               padding:16px 20px; min-width:180px; }
-  .stat-label { font-size:11px; color:#8b8fa3; font-weight:600; letter-spacing:.06em; margin-bottom:6px; }
-  .stat-value { font-size:26px; font-weight:700; }
-  .stat-sub { font-size:11px; color:#8b8fa3; margin-top:4px; }
-  .badge-live { display:inline-block; background:#14532d; color:#4ade80;
-                font-size:11px; font-weight:700; padding:2px 8px; border-radius:4px; }
-  .badge-soon { display:inline-block; background:#422006; color:#facc15;
-                font-size:11px; font-weight:700; padding:2px 8px; border-radius:4px; }
-  .badge-no { display:inline-block; background:#2d1515; color:#f87171;
-              font-size:11px; padding:2px 8px; border-radius:4px; }
-  .badge-na { display:inline-block; background:#1f222c; color:#8b8fa3;
-              font-size:11px; padding:2px 8px; border-radius:4px; }
-  .section-title { font-size:13px; color:#8b8fa3; font-weight:600;
-                   letter-spacing:.08em; margin:28px 0 12px; }
+  .autocomplete-list div { padding:8px 11px; cursor:pointer; text-align:left; font-size:13px;
+                            font-family:'JetBrains Mono', monospace; }
+  .autocomplete-list div:hover, .autocomplete-list div.active-item { background:var(--row); }
+  .stat-cards { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:26px; }
+  .stat-card { background:var(--panel); border:1px solid var(--border); border-radius:10px;
+               padding:18px 20px; min-width:170px; flex:1; }
+  .stat-label { font-size:10px; color:var(--muted); font-weight:700; letter-spacing:.08em;
+                margin-bottom:8px; text-transform:uppercase; }
+  .stat-value { font-size:28px; font-weight:700; font-family:'JetBrains Mono', monospace; }
+  .stat-sub { font-size:11px; color:var(--muted); margin-top:5px; }
+  .badge-live { display:inline-block; background:var(--profit-dim); color:var(--profit);
+                font-size:10.5px; font-weight:700; padding:3px 9px; border-radius:4px;
+                letter-spacing:.03em; }
+  .badge-soon { display:inline-block; background:var(--near-dim); color:var(--near);
+                font-size:10.5px; font-weight:700; padding:3px 9px; border-radius:4px; }
+  .badge-no { display:inline-block; background:var(--loss-dim); color:var(--loss);
+              font-size:10.5px; padding:3px 9px; border-radius:4px; }
+  .badge-na { display:inline-block; background:var(--row); color:var(--muted);
+              font-size:10.5px; padding:3px 9px; border-radius:4px; }
+  .section-title { font-size:11px; color:var(--muted); font-weight:700;
+                    letter-spacing:.1em; margin:30px 0 14px; text-transform:uppercase; }
+  .spread-wrap { display:inline-flex; align-items:center; gap:8px; justify-content:flex-end;
+                 width:100%; }
+  .spread-track { width:52px; height:5px; background:var(--border-soft); border-radius:3px;
+                   overflow:hidden; flex-shrink:0; }
+  .spread-fill { display:block; height:100%; border-radius:3px; }
 """
 
 NAV = """
@@ -273,6 +329,22 @@ NAV = """
 def nav_html(active):
     keys = ["scanner", "indian", "indiaopp", "indiabt", "backtest", "multi", "opp"]
     return NAV.format(**{f"{k}_active": ("active" if k == active else "") for k in keys})
+
+
+def spread_bar(net_pct, css_class, max_scale=0.3):
+    """Renders the net% value alongside a small horizontal bar showing its
+    magnitude relative to max_scale (default 0.3% - anything at/above that
+    fills the bar). Purely visual - lets you scan a column and spot the
+    strongest opportunities by bar length before even reading numbers."""
+    color = {"profit": "var(--profit)", "loss": "var(--muted)", "near": "var(--near)"}.get(css_class, "var(--muted)")
+    pct_width = min(abs(net_pct) / max_scale, 1.0) * 100
+    return (
+        f'<span class="spread-wrap">'
+        f'<span class="{css_class}">{net_pct:+.5f}%</span>'
+        f'<span class="spread-track"><span class="spread-fill" '
+        f'style="width:{pct_width:.0f}%;background:{color};"></span></span>'
+        f'</span>'
+    )
 
 SCANNER_JS = """
 <script>
@@ -429,19 +501,19 @@ INDIAN_EXCHANGES_PAGE = """
 <div class="stat-cards">
   <div class="stat-card">
     <div class="stat-label">DELTA EXCHANGE INDIA \u00b7 BTCUSD</div>
-    <div class="stat-value" style="color:#4ade80">{delta_btc_rate}</div>
+    <div class="stat-value" style="color:#00D084">{delta_btc_rate}</div>
     <div class="stat-sub">per 8-hour funding period</div>
     <div style="margin-top:10px"><span class="badge-live">\U0001f7e2 LIVE</span></div>
   </div>
   <div class="stat-card">
     <div class="stat-label">PI42 \u00b7 BTCUSDT</div>
-    <div class="stat-value" style="color:#4ade80">{pi42_btc_rate}</div>
+    <div class="stat-value" style="color:#00D084">{pi42_btc_rate}</div>
     <div class="stat-sub">per funding period (4\u20138 hrs)</div>
     <div style="margin-top:10px"><span class="badge-live">\U0001f7e2 LIVE</span></div>
   </div>
   <div class="stat-card">
     <div class="stat-label">COINSWITCH PRO \u00b7 BTCUSDT</div>
-    <div class="stat-value" style="color:#4ade80">{coinswitch_btc_rate}</div>
+    <div class="stat-value" style="color:#00D084">{coinswitch_btc_rate}</div>
     <div class="stat-sub">per 8-hour funding period</div>
     <div style="margin-top:10px"><span class="badge-live">\U0001f7e2 LIVE</span></div>
   </div>
@@ -488,12 +560,12 @@ INDIAN_OPPORTUNITIES_PAGE = """
   </div>
   <div class="stat-card">
     <div class="stat-label">BEST COIN</div>
-    <div class="stat-value" style="color:#4ade80">{best_coin}</div>
+    <div class="stat-value" style="color:#00D084">{best_coin}</div>
     <div class="stat-sub">net {best_net}% via {best_pair}</div>
   </div>
   <div class="stat-card">
     <div class="stat-label">NEAR MISS</div>
-    <div class="stat-value" style="color:#facc15">{near_count}</div>
+    <div class="stat-value" style="color:#FFB020">{near_count}</div>
     <div class="stat-sub">coins within 0.05% of profitability</div>
   </div>
   <div class="stat-card">
@@ -539,7 +611,7 @@ INDIAN_BACKTEST_PAGE = """
 
 def render_scanner_page():
     if _scan_error:
-        status = f'<span style="color:#f87171">Last scan failed: {_scan_error}</span>'
+        status = f'<span style="color:#FF4757">Last scan failed: {_scan_error}</span>'
     elif _last_scan_time is None:
         status = "First scan starting up... refresh in a few seconds."
     else:
@@ -566,7 +638,7 @@ def render_scanner_page():
             f"<td>{r['delta_funding_pct']:.5f}</td>"
             f"<td>{r['pi42_funding_pct']:.5f}</td>"
             f"<td>{r['gap_pct']:.5f}</td>"
-            f"<td class='{cls}'>{r['net_pct']:+.5f}</td>"
+            f"<td>{spread_bar(r['net_pct'], cls)}</td>"
             f"<td>{r['delta_volume_usd']:,.0f}</td></tr>"
         )
     if not rows_html:
@@ -658,9 +730,9 @@ def render_opportunities_page():
 
     if _ingest_running:
         done, total = _ingest_progress
-        ingest_status = f'<span style="color:#facc15">Ingesting: {done}/{total} pairs...</span>'
+        ingest_status = f'<span style="color:#FFB020">Ingesting: {done}/{total} pairs...</span>'
     elif _ingest_error:
-        ingest_status = f'<span style="color:#f87171">Last ingestion failed: {_ingest_error}</span>'
+        ingest_status = f'<span style="color:#FF4757">Last ingestion failed: {_ingest_error}</span>'
     elif _ingest_last_run is None:
         ingest_status = "Ingestion starting up..."
     else:
@@ -672,9 +744,9 @@ def render_opportunities_page():
         )
 
     if _opp_running:
-        rank_status = '<span style="color:#facc15">Ranking...</span>'
+        rank_status = '<span style="color:#FFB020">Ranking...</span>'
     elif _opp_error:
-        rank_status = f'<span style="color:#f87171">Last ranking pass failed: {_opp_error}</span>'
+        rank_status = f'<span style="color:#FF4757">Last ranking pass failed: {_opp_error}</span>'
     elif _opp_last_run is None:
         rank_status = "Waiting for first ingestion pass..."
     else:
@@ -726,7 +798,7 @@ def render_indian_exchanges_page():
 
     rows_html = ""
     for exc in INDIAN_EXCHANGE_REGISTRY:
-        docs = f'<a href="{exc["api_docs"]}" target="_blank" style="color:#8b8fa3;font-size:11px">{exc["name"]} docs \u2197</a>'
+        docs = f'<a href="{exc["api_docs"]}" target="_blank" style="color:var(--muted-2);font-size:11px">{exc["name"]} docs \u2197</a>'
         futures_str = "\u2705" if exc["futures"] else "\u274c"
         fiu_str = "\u2705" if exc["fiu_registered"] else "\u274c"
         rows_html += (
@@ -734,7 +806,7 @@ def render_indian_exchanges_page():
             f"<td style='text-align:center'>{futures_str}</td><td>{exc.get('pairs','\u2014')}</td>"
             f"<td>{exc.get('funding_interval','N/A')}</td><td>{api_map.get(exc['api_status'],'')}</td>"
             f"<td style='text-align:center'>{fiu_str}</td><td>{int_map.get(exc['integration'],'')}</td>"
-            f"<td style='font-size:12px;color:#8b8fa3'>{exc['notes']}</td></tr>"
+            f"<td style='font-size:12px;color:var(--muted-2)'>{exc['notes']}</td></tr>"
         )
 
     return INDIAN_EXCHANGES_PAGE.format(
@@ -758,8 +830,8 @@ def render_indian_opportunities_page():
 
     profitable_count = len(profitable)
     near_count = len(near)
-    profitable_color = "#4ade80" if profitable_count > 0 else "#8b8fa3"
-    profitable_border = "#166534" if profitable_count > 0 else "#2a2d38"
+    profitable_color = "#00D084" if profitable_count > 0 else "var(--muted-2)"
+    profitable_border = "#0A2E22" if profitable_count > 0 else "var(--border)"
 
     if profitable:
         best = max(profitable, key=lambda r: r["net_pct"])
@@ -783,7 +855,7 @@ def render_indian_opportunities_page():
                 f"<td>{rate_or_na(r['pi42_funding_pct'])}</td>"
                 f"<td>{rate_or_na(r['coinswitch_funding_pct'])}</td>"
                 f"<td>{r['gap_pct']:.5f}%</td>"
-                f"<td class='profit'>{r['net_pct']:+.5f}%</td>"
+                f"<td>{spread_bar(r['net_pct'], 'profit')}</td>"
                 f"<td class='profit'>{apy_est:+.1f}%</td></tr>"
             )
         profitable_section = f"""
@@ -796,7 +868,7 @@ def render_indian_opportunities_page():
     else:
         profitable_section = (
             '<div class="section-title">\U0001f7e2 PROFITABLE OPPORTUNITIES</div>'
-            '<div class="note" style="background:#1a1d27;border:1px solid #2a2d38;'
+            '<div class="note" style="background:var(--panel);border:1px solid var(--border);'
             'border-radius:8px;padding:16px;margin-bottom:20px;">'
             'No profitable opportunities right now across any of the 3 pairs. '
             'Near misses shown below.</div>'
@@ -812,7 +884,7 @@ def render_indian_opportunities_page():
                 f"<td>{rate_or_na(r['pi42_funding_pct'])}</td>"
                 f"<td>{rate_or_na(r['coinswitch_funding_pct'])}</td>"
                 f"<td>{r['gap_pct']:.5f}%</td>"
-                f"<td class='near'>{r['net_pct']:+.5f}%</td></tr>"
+                f"<td>{spread_bar(r['net_pct'], 'near')}</td></tr>"
             )
         near_section = f"""
         <div class="section-title" style="margin-top:28px">\U0001f7e1 NEAR MISSES ({near_count})</div>

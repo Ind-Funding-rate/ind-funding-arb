@@ -63,6 +63,8 @@ import threading
 import time
 from datetime import datetime
 
+import websockets
+
 from src.execution.full_market_scanner import get_delta_funding_all, COINS as _FUNDING_COINS
 from src.data.coinswitch_client import get_all_funding_rates
 

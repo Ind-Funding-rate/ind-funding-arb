@@ -5,12 +5,15 @@ Delta/Pi42 backtest (our own logged data), multi-exchange historical
 backtest, and an automated opportunity matrix scanner across ALL
 available coins x exchange pairs.
 
-Runs THREE background loops, decoupled from each other:
+Runs FOUR background loops, decoupled from each other:
 1. Live full-market scanner (Delta vs Pi42, 133 coins, every ~90s)
 2. INGESTION: pulls historical data from Bybit/OKX into our own local
    database, in parallel (ThreadPoolExecutor), every 30 min.
 3. RANKING: reads from that local database (fast, no network) and
    recomputes the ranked opportunity list every 5 min.
+4. Spread scanner price cache: independent Delta/Pi42/CoinSwitch price
+   refresh, every 90s (see src/web/spread_scanner.py for why this is
+   kept separate from loop 1 rather than sharing its data).
 
 Binds to whatever port HidenCloud/Pterodactyl assigns via the SERVER_PORT
 env var (falls back to 8080 if not set, for local testing).
@@ -39,7 +42,10 @@ from src.execution.advanced_backtest import (
 )
 from src.data.ingest_funding import ingest_all
 from src.data.funding_history_store import init_store, get_store_stats
-from src.web.spread_scanner import render_spread_scanner_page, get_spread_rows
+from src.web.spread_scanner import (
+    render_spread_scanner_page, get_spread_rows, get_cache_status,
+    start_spread_background_loop,
+)
 
 app = Flask(__name__)
 
@@ -927,7 +933,13 @@ def spread_scanner_data_route():
     search = request.args.get("search", "")
     min_spread = float(request.args.get("min_spread", 0) or 0)
     rows = get_spread_rows(exchange_a, exchange_b, search, min_spread)
-    return jsonify({"rows": rows})
+    status, error, age = get_cache_status()
+    return jsonify({
+        "rows": rows,
+        "cache_status": status,
+        "cache_error": error,
+        "cache_age_seconds": age,
+    })
 
 
 @app.route("/backtest")
@@ -956,6 +968,7 @@ if __name__ == "__main__":
     threading.Thread(target=background_scanner, daemon=True).start()
     threading.Thread(target=ingestion_background, daemon=True).start()
     threading.Thread(target=ranking_background, daemon=True).start()
+    start_spread_background_loop()
 
     port = int(os.getenv("SERVER_PORT", 8080))
     print(f"Starting web dashboard on 0.0.0.0:{port}")

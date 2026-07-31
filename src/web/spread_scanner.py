@@ -32,6 +32,16 @@ really just a unit difference, not a real price gap.
 Page requests never call an exchange directly - they only ever read the
 in-memory cache built by the background loop, so response time doesn't
 depend on exchange latency.
+
+2026-07-31 fix: SPREAD_SCANNER_JS is now a raw string (r\"\"\"...\"\"\").
+It contains JavaScript's own \\uXXXX escape for an emoji
+(\\ud83d\\udfe2 - a UTF-16 surrogate pair, valid JS). Without the raw
+prefix, PYTHON was interpreting that escape itself before the page ever
+reached the browser - producing two lone surrogate codepoints, which
+crashed every request to /spread-scanner with
+UnicodeEncodeError: 'utf-8' codec can't encode ... surrogates not
+allowed the moment Flask tried to encode the response. Raw string stops
+Python touching JS's own escape sequences.
 """
 import threading
 import time
@@ -207,7 +217,7 @@ SPREAD_SCANNER_CSS = """
   .status-neutral { color:#8b8fa3; }
 """
 
-SPREAD_SCANNER_JS = """
+SPREAD_SCANNER_JS = r"""
 <script>
 let autoRefreshTimer = null;
 

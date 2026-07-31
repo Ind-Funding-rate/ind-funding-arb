@@ -136,11 +136,19 @@ def place_delta_order(side, qty):
 
 # ══════════════════════════════════════════════════════
 #  WEBSITE (background) - src/web/app.py
-#  Runs the full Flask dashboard (8 pages: live scanner,
-#  3-way scanner w/ CoinSwitch, Indian exchanges/opportunities/
-#  backtest, global backtest, opportunity matrix) in this same
-#  process, in background threads, alongside the BTC executor
-#  loop below.
+#
+#  2026-07-31: TEMPORARY compatibility fix. src/web/app.py was
+#  independently rewritten (by Codex) since this was last touched here -
+#  it no longer has background_three_way_scanner (the CoinSwitch 3-way
+#  integration was removed from that file), and it gained a new
+#  "Spread Scanner" page with its own start_spread_background_loop().
+#  This import list now matches whatever src/web/app.py ACTUALLY
+#  exports today, so the site boots instead of crashing - this is not
+#  a decision about which version is "right", just getting the site
+#  running again so it can be evaluated. See conversation with Nikunj
+#  before changing src/web/app.py further - there's an unresolved
+#  question about whether to restore the 3-way/CoinSwitch integration
+#  and visual redesign that were both dropped in that rewrite.
 # ══════════════════════════════════════════════════════
 
 def run_website_background():
@@ -148,18 +156,18 @@ def run_website_background():
         from src.web.app import (
             app as flask_app,
             background_scanner,
-            background_three_way_scanner,
             ingestion_background,
             ranking_background,
+            start_spread_background_loop,
         )
     except Exception as e:
         print(f"  [WEB] Failed to load website module: {e}")
         return
 
     threading.Thread(target=background_scanner, daemon=True).start()
-    threading.Thread(target=background_three_way_scanner, daemon=True).start()
     threading.Thread(target=ingestion_background, daemon=True).start()
     threading.Thread(target=ranking_background, daemon=True).start()
+    start_spread_background_loop()
 
     port = int(os.getenv("SERVER_PORT", 8080))
     print(f"  [WEB] Starting dashboard on 0.0.0.0:{port}")

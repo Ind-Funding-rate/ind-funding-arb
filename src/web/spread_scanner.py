@@ -48,6 +48,13 @@ spread for that coin is shown (same "best pair wins" pattern used in
 the 3-way funding-rate scanner). Also added a "show top N" selector
 (10/20/50) so the page shows only the biggest opportunities at a
 glance instead of every coin with any data.
+
+Bug caught before deploy: the JS auto-refresh path referenced
+r.exchange_a_label/r.exchange_b_label, fields the JSON endpoint never
+actually sends (only raw keys like "delta"/"pi42") - would have shown
+"undefined vs undefined" on every auto-refresh. Fixed by giving the JS
+its own EXCHANGE_LABELS map instead of expecting the server to send
+pre-formatted label strings.
 """
 import asyncio
 import itertools
@@ -204,6 +211,9 @@ def get_spread_rows(selected_exchanges, search="", min_spread=0.0, limit=10):
     Returns list of dicts:
     {coin, exchange_a, exchange_b, price_a, price_b, diff, spread_pct,
      last_updated, status}
+    exchange_a/exchange_b are raw keys ("delta"/"pi42"/"coinswitch") -
+    label lookup happens client-side (JS) or server-side (Python), not
+    baked into this data.
     """
     with _cache_lock:
         snapshot = dict(_price_cache)
@@ -289,6 +299,7 @@ SPREAD_SCANNER_CSS = """
 
 SPREAD_SCANNER_JS = r"""
 <script>
+const EXCHANGE_LABELS = {"delta": "Delta Exchange", "pi42": "Pi42", "coinswitch": "CoinSwitch"};
 let autoRefreshTimer = null;
 
 function buildQuery() {
@@ -310,9 +321,10 @@ function renderRows(rows) {
   tbody.innerHTML = rows.map(function(r) {
     const sign = r.diff >= 0 ? '+' : '';
     const pctSign = r.spread_pct >= 0 ? '+' : '';
+    const pairLabel = (EXCHANGE_LABELS[r.exchange_a] || r.exchange_a) + ' vs ' + (EXCHANGE_LABELS[r.exchange_b] || r.exchange_b);
     return '<tr>' +
       '<td><b>' + r.coin + '</b></td>' +
-      '<td class="pair-tag">' + r.exchange_a_label + ' vs ' + r.exchange_b_label + '</td>' +
+      '<td class="pair-tag">' + pairLabel + '</td>' +
       '<td>$' + r.price_a.toLocaleString(undefined, {maximumFractionDigits: 8}) + '</td>' +
       '<td>$' + r.price_b.toLocaleString(undefined, {maximumFractionDigits: 8}) + '</td>' +
       '<td>' + sign + '$' + r.diff.toLocaleString(undefined, {maximumFractionDigits: 8}) + '</td>' +

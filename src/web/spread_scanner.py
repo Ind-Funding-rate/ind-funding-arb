@@ -6,28 +6,21 @@ expressed as a spread %. This does NOT touch the funding-rate scanner's
 detection/alerting/backtesting logic or the SQLite database - it is a
 standalone screener, by design.
 
-Price data IS reused from the exchange-calling utility functions that
-full_market_scanner.py and coinswitch_client.py already have
-(get_delta_funding_all, get_pi42_funding_all, get_all_funding_rates) -
-these are pure "ask exchange X for its current numbers" functions, not
-strategy logic, so reusing them avoids re-solving already-fixed bugs
-(e.g. the Pi42 field-name issue found earlier). This module runs its
-own SEPARATE background refresh loop and keeps its own cache, so it
-never reads the funding scanner's _latest_rows or depends on its timing.
+Delta and CoinSwitch price data is reused from the exchange-calling
+utility functions that full_market_scanner.py and coinswitch_client.py
+already have (get_delta_funding_all, get_all_funding_rates) - these are
+pure "ask exchange X for its current numbers" functions, not strategy
+logic, so reusing them avoids re-solving already-fixed bugs. This module
+runs its own SEPARATE background refresh loop and keeps its own cache,
+so it never reads the funding scanner's _latest_rows or depends on its
+timing.
 
-Tradeoff worth knowing: Pi42 price data comes via a websocket batch
-subscription (same mechanism the funding scanner uses), and running a
-second, independent one here roughly doubles Pi42 connection load
-compared to before this page existed. Refresh interval is set to match
-the funding scanner's own cadence (90s) rather than anything faster, to
-avoid pushing that further.
-
-Unit note: Delta/Pi42 use multiplier-prefixed symbols for some coins
-(e.g. "1000BONK" = price of 1000 BONK, "1MBABYDOGE" = price of
-1,000,000 BABYDOGE) while CoinSwitch does not. Prices are normalized to
-a true per-unit basis before computing spreads, or coins on the
-mismatched side would show a fake ~1000x/1,000,000x "spread" that's
-really just a unit difference, not a real price gap.
+Unit note: Delta uses multiplier-prefixed symbols for some coins (e.g.
+"1000BONK" = price of 1000 BONK, "1MBABYDOGE" = price of 1,000,000
+BABYDOGE) while CoinSwitch and Pi42's USDT market do not. Delta prices
+are normalized to a true per-unit basis before computing spreads, or
+coins on the mismatched side would show a fake ~1000x/1,000,000x
+"spread" that's really just a unit difference, not a real price gap.
 
 Page requests never call an exchange directly - they only ever read the
 in-memory cache built by the background loop, so response time doesn't
@@ -38,55 +31,52 @@ It contains JavaScript's own \\uXXXX escape for an emoji
 (\\ud83d\\udfe2 - a UTF-16 surrogate pair, valid JS). Without the raw
 prefix, PYTHON was interpreting that escape itself before the page ever
 reached the browser - producing two lone surrogate codepoints, which
-crashed every request to /spread-scanner with
-UnicodeEncodeError: 'utf-8' codec can't encode ... surrogates not
-allowed the moment Flask tried to encode the response. Raw string stops
-Python touching JS's own escape sequences.
+crashed every request with UnicodeEncodeError. Raw string stops Python
+touching JS's own escape sequences.
 
-2026-07-31 fix #2: CURRENCY MISMATCH. Delta quotes prices in USD,
-CoinSwitch in USDT (~USD), but Pi42 quotes in INR - and prices were
-being compared directly with no conversion, producing nonsense spreads
-like "+9400%" for every single coin (that's just roughly the USD/INR
-exchange rate, not a real arbitrage signal). Pi42 prices are converted
-to USD using a live USD/INR rate before being placed in the shared
-price cache.
+2026-07-31 fix #2/#3 (superseded by fix #4 below): tried converting
+Pi42's INR prices to USD via a live USD/INR forex rate. First attempt
+used the wrong Frankfurter endpoint and silently fell back to a
+hardcoded rate, producing a suspiciously uniform ~+8% "spread" on every
+single coin - a currency conversion bug, not real arbitrage.
 
-2026-07-31 fix #3 (found by Nikunj immediately after #2 - every coin
-was STILL showing a suspiciously uniform +8.1-8.3% spread, a dead
-giveaway of a systematic error rather than real per-coin spreads): the
-FX fetch itself was silently failing and falling back to the hardcoded
-88.0 default, because it used the wrong Frankfurter endpoint/path
-(v2/latest with a "symbols" param that doesn't match that path's actual
-shape) - switched to the long-stable, thoroughly documented v1 endpoint
-(https://api.frankfurter.dev/v1/latest?base=USD&symbols=INR), verified
-directly against Frankfurter's own docs before this fix, not guessed.
+2026-07-31 fix #4 (Nikunj's call - better than converting currencies at
+all): Pi42 actually offers a native USDT-margined market alongside its
+INR one ("crypto-INR and crypto-USDT pairs", confirmed on Pi42's own
+site, then verified live via a standalone test - subscribing to e.g.
+"btcusdt@markPrice" over the same websocket returns real USDT-priced
+data). Switched to pulling Pi42's prices from THIS market instead of
+INR - Delta, Pi42, and CoinSwitch are now all queried in their own
+native USD/USDT terms, so spreads are genuinely apples-to-apples with
+no currency conversion, no external FX dependency, and one less thing
+that can silently drift stale. All the FX-rate code from fix #2/#3 has
+been removed as no longer needed.
+
+Note: this project's core funding-RATE arbitrage strategy (the main
+scanner, not this page) intentionally still uses Pi42's INR market -
+that's the actual product being traded there. This USDT channel is
+used ONLY by this independent price-spread screener.
 """
+import asyncio
+import json
 import threading
 import time
-import requests
 from datetime import datetime
 
-from src.execution.full_market_scanner import (
-    get_delta_funding_all, get_pi42_funding_all, COINS as _FUNDING_COINS,
-)
+from src.execution.full_market_scanner import get_delta_funding_all, COINS as _FUNDING_COINS
 from src.data.coinswitch_client import get_all_funding_rates
 
 EXCHANGES = ["delta", "pi42", "coinswitch"]
 EXCHANGE_LABELS = {"delta": "Delta Exchange", "pi42": "Pi42", "coinswitch": "CoinSwitch"}
 
 REFRESH_INTERVAL_SECONDS = 90
-FX_REFRESH_INTERVAL_SECONDS = 60 * 60  # USD/INR moves slowly - no need to hit this every cycle
-FX_FALLBACK_USD_INR = 93.0  # used only if the FX API is unreachable on first run
+PI42_WS_URL = "wss://fawss.pi42.com/socket.io/?EIO=4&transport=websocket"
+PI42_WS_WINDOW_SECONDS = 45  # matches the funding scanner's own window
 
 _price_cache = {}   # {coin: {"delta": price_or_missing, "pi42": ..., "coinswitch": ...}}
 _cache_lock = threading.Lock()
 _cache_updated_at = None
 _cache_error = None
-
-_fx_lock = threading.Lock()
-_usd_inr_rate = FX_FALLBACK_USD_INR
-_fx_updated_at = None
-_fx_source = "fallback"  # "live" once a real fetch succeeds - shown on the page for transparency
 
 
 def _multiplier_strip(raw_symbol):
@@ -101,49 +91,63 @@ def _multiplier_strip(raw_symbol):
     return raw_symbol, 1
 
 
-def _refresh_usd_inr_rate():
-    """Updates the cached USD/INR rate if it's stale (>1 hour old) or has
-    never been fetched. Free, no API key: api.frankfurter.dev (v1 - the
-    long-stable, documented endpoint; v2 has a different/undocumented-here
-    shape and was the cause of a earlier silent-fallback bug)."""
-    global _usd_inr_rate, _fx_updated_at, _fx_source
-    with _fx_lock:
-        if _fx_updated_at is not None:
-            age = (datetime.now() - _fx_updated_at).total_seconds()
-            if age < FX_REFRESH_INTERVAL_SECONDS:
-                return _usd_inr_rate
+async def _pi42_usdt_ws_batch(coins):
+    """Pi42's native USDT-margined market - confirmed working via a
+    standalone test (src/data/test_pi42_usdt_channel.py) on 2026-07-31:
+    subscribing to '{symbol}usdt@markPrice' returns real, live
+    USDT-denominated mark prices. Same socket.io protocol as the INR
+    channel already used elsewhere in this project."""
+    channels = [f"{_multiplier_strip(c)[0].lower()}usdt@markPrice" for c in coins]
+    results = {}
+    async with websockets.connect(PI42_WS_URL) as ws:
+        await ws.recv()
+        await ws.send("40")
+        await ws.recv()
+        sub_msg = f'42["subscribe", {{"params": {json.dumps(channels)}}}]'
+        await ws.send(sub_msg)
 
+        end_time = asyncio.get_event_loop().time() + PI42_WS_WINDOW_SECONDS
+        while len(results) < len(channels):
+            remaining = end_time - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                msg = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+            if msg == "2":
+                await ws.send("3")
+                continue
+            if not msg.startswith("42["):
+                continue
+            payload = json.loads(msg[2:])
+            event_name = payload[0]
+            data = payload[1] if len(payload) > 1 else {}
+            if event_name == "markPriceUpdate":
+                sym = data.get("s", "")
+                if sym.endswith("USDT"):
+                    base = sym[:-4]
+                    if base not in results:
+                        price = data.get("p", 0)
+                        results[base] = float(price) if price else 0
+    return results
+
+
+def get_pi42_usdt_all(coins):
     try:
-        r = requests.get(
-            "https://api.frankfurter.dev/v1/latest",
-            params={"base": "USD", "symbols": "INR"},
-            timeout=10,
-        )
-        r.raise_for_status()
-        data = r.json()
-        rate = float(data["rates"]["INR"])
-        with _fx_lock:
-            _usd_inr_rate = rate
-            _fx_updated_at = datetime.now()
-            _fx_source = "live"
-        print(f"[spread-scanner] USD/INR rate refreshed: {rate}")
+        return asyncio.run(_pi42_usdt_ws_batch(coins))
     except Exception as e:
-        with _fx_lock:
-            _fx_source = "fallback"
-        print(f"[spread-scanner] USD/INR fetch failed, using last known rate "
-              f"({_usd_inr_rate}, source={_fx_source}): {e}")
-    return _usd_inr_rate
+        print(f"[spread-scanner] Pi42 USDT batch fetch failed: {e}")
+        return {}
 
 
 def refresh_price_cache():
-    """Fetches current prices from all three exchanges and rebuilds the
+    """Fetches current prices from all three exchanges (each in its own
+    native USD/USDT terms - no currency conversion) and rebuilds the
     cache. Only ever called from the background loop below - never from
-    a web request, so a slow Pi42 fetch never makes a page load slow.
-    Pi42 prices are converted from INR to USD here so every exchange in
-    the cache is denominated in the same currency."""
+    a web request, so a slow Pi42 fetch never makes a page load slow."""
     global _price_cache, _cache_updated_at, _cache_error
     try:
-        usd_inr = _refresh_usd_inr_rate()
         merged = {}
 
         delta_data = get_delta_funding_all()
@@ -153,13 +157,10 @@ def refresh_price_cache():
             if price:
                 merged.setdefault(coin, {})["delta"] = price / mult
 
-        pi42_data = get_pi42_funding_all(_FUNDING_COINS)
-        for raw_symbol, info in pi42_data.items():
-            coin, mult = _multiplier_strip(raw_symbol)
-            price_inr = info.get("price", 0)
-            if price_inr:
-                price_usd = price_inr / usd_inr  # INR -> USD conversion
-                merged.setdefault(coin, {})["pi42"] = price_usd / mult
+        pi42_usdt_data = get_pi42_usdt_all(_FUNDING_COINS)
+        for coin, price in pi42_usdt_data.items():
+            if price:
+                merged.setdefault(coin, {})["pi42"] = price
 
         cs_data = get_all_funding_rates()
         for raw_symbol, info in cs_data.items():
@@ -176,8 +177,7 @@ def refresh_price_cache():
             _cache_error = None
 
         print(f"[spread-scanner] cache refreshed: {len(merged)} coins have at least one "
-              f"price (all in USD, Pi42 converted @ {usd_inr:.3f} INR/USD, "
-              f"fx source={_fx_source})")
+              f"price (all native USD/USDT - Delta USD, Pi42 USDT market, CoinSwitch USDT)")
     except Exception as e:
         with _cache_lock:
             _cache_error = str(e)
@@ -208,7 +208,7 @@ def get_cache_status():
 
 def get_spread_rows(exchange_a, exchange_b, search="", min_spread=0.0):
     """
-    Returns a list of dicts, one per coin (all prices already in USD):
+    Returns a list of dicts, one per coin (all prices in native USD/USDT):
     {coin, price_a, price_b, diff, spread_pct, last_updated, status}
     Reads from the in-memory price cache only.
     """
@@ -278,7 +278,6 @@ SPREAD_SCANNER_CSS = """
     font-size:12px; padding:8px 14px; border-radius:6px; margin-bottom:16px;
   }
   .fx-note { color:#8b8fa3; font-size:11px; margin:-10px 0 16px; }
-  .fx-note.fx-fallback { color:#facc15; }
   #spread-tbl thead th { position:sticky; top:0; }
   .status-positive { color:#4ade80; font-weight:700; }
   .status-negative { color:#f87171; font-weight:700; }
@@ -369,7 +368,7 @@ SPREAD_SCANNER_PAGE = """
 <h2 style="font-size:18px;margin:0 0 6px;">Spread Arbitrage Scanner</h2>
 <p class="meta">Live price spread between two exchanges for the same coin. Independent of the funding-rate scanner \u2014 no signals, no backtesting, no trade execution.</p>
 <div id="status-banner" class="{banner_class}">{banner_text}</div>
-<p class="fx-note {fx_note_class}">All prices shown in USD. Pi42 quotes in INR and is converted using a {fx_source_label} USD/INR rate (\u2248 {usd_inr_rate:.2f}), refreshed hourly.</p>
+<p class="fx-note">All prices are each exchange's own native USD/USDT market \u2014 Delta USD, Pi42's USDT market (not INR), CoinSwitch USDT. No currency conversion involved.</p>
 
 <div class="spread-controls">
   <div><label>Exchange A</label>
@@ -424,10 +423,6 @@ def render_spread_scanner_page(base_css, nav_html, exchange_a="delta", exchange_
     rows = get_spread_rows(exchange_a, exchange_b, search, min_spread)
     status, error, age = get_cache_status()
 
-    with _fx_lock:
-        current_rate = _usd_inr_rate
-        fx_src = _fx_source
-
     if status == "live":
         banner_class = "live-banner"
         banner_text = f"\U0001f7e2 Live data \u00b7 updated {int(age)}s ago"
@@ -438,9 +433,6 @@ def render_spread_scanner_page(base_css, nav_html, exchange_a="delta", exchange_
         banner_class = "mock-banner"
         banner_text = "\u23f3 Fetching real prices for the first time - this can take up to a minute..."
 
-    fx_source_label = "live" if fx_src == "live" else "FALLBACK (not live - check server logs)"
-    fx_note_class = "" if fx_src == "live" else "fx-fallback"
-
     def options(selected):
         return "".join(
             f'<option value="{e}" {"selected" if e == selected else ""}>{EXCHANGE_LABELS[e]}</option>'
@@ -450,7 +442,6 @@ def render_spread_scanner_page(base_css, nav_html, exchange_a="delta", exchange_
     return SPREAD_SCANNER_PAGE.format(
         css=base_css, spread_css=SPREAD_SCANNER_CSS, nav=nav_html,
         banner_class=banner_class, banner_text=banner_text,
-        usd_inr_rate=current_rate, fx_source_label=fx_source_label, fx_note_class=fx_note_class,
         exchange_a_options=options(exchange_a),
         exchange_b_options=options(exchange_b),
         rows=_render_rows_html(rows),

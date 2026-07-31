@@ -2,70 +2,159 @@
 Spread Arbitrage Scanner - a fully independent module.
 
 Shows the live PRICE difference for the same coin across two exchanges,
-expressed as a spread %. This does NOT touch the funding-rate scanner,
-the backtest engine, the SQLite database, or any existing strategy logic
-- it is a standalone screener, by design.
+expressed as a spread %. This does NOT touch the funding-rate scanner's
+detection/alerting/backtesting logic or the SQLite database - it is a
+standalone screener, by design.
 
-Currently ships with placeholder/mock data (clearly labeled as such on
-the page). get_spread_rows() is the one function that needs to change to
-plug in real prices later - the render function, the JSON endpoint, and
-all of the front-end JS already work against its current return shape
-and won't need to change when real data replaces the mock data.
+Price data IS reused from the exchange-calling utility functions that
+full_market_scanner.py and coinswitch_client.py already have
+(get_delta_funding_all, get_pi42_funding_all, get_all_funding_rates) -
+these are pure "ask exchange X for its current numbers" functions, not
+strategy logic, so reusing them avoids re-solving already-fixed bugs
+(e.g. the Pi42 field-name issue found earlier). This module runs its
+own SEPARATE background refresh loop and keeps its own cache, so it
+never reads the funding scanner's _latest_rows or depends on its timing.
+
+Tradeoff worth knowing: Pi42 price data comes via a websocket batch
+subscription (same mechanism the funding scanner uses), and running a
+second, independent one here roughly doubles Pi42 connection load
+compared to before this page existed. Refresh interval is set to match
+the funding scanner's own cadence (90s) rather than anything faster, to
+avoid pushing that further.
+
+Unit note: Delta/Pi42 use multiplier-prefixed symbols for some coins
+(e.g. "1000BONK" = price of 1000 BONK, "1MBABYDOGE" = price of
+1,000,000 BABYDOGE) while CoinSwitch does not. Prices are normalized to
+a true per-unit basis before computing spreads, or coins on the
+mismatched side would show a fake ~1000x/1,000,000x "spread" that's
+really just a unit difference, not a real price gap.
+
+Page requests never call an exchange directly - they only ever read the
+in-memory cache built by the background loop, so response time doesn't
+depend on exchange latency.
 """
-import random
+import threading
+import time
 from datetime import datetime
+
+from src.execution.full_market_scanner import (
+    get_delta_funding_all, get_pi42_funding_all, COINS as _FUNDING_COINS,
+)
+from src.data.coinswitch_client import get_all_funding_rates
 
 EXCHANGES = ["delta", "pi42", "coinswitch"]
 EXCHANGE_LABELS = {"delta": "Delta Exchange", "pi42": "Pi42", "coinswitch": "CoinSwitch"}
 
-# Base mock prices (USD-equivalent) - stable across refreshes, small jitter
-# added per call so "auto refresh" visibly does something even in mock mode.
-_MOCK_BASE_PRICES = {
-    "BTC": 60000, "ETH": 3300, "SOL": 145, "XRP": 0.62, "DOGE": 0.14,
-    "ADA": 0.45, "LINK": 14.5, "AVAX": 28, "DOT": 6.8, "LTC": 82,
-    "BCH": 420, "UNI": 8.2, "SUI": 3.6, "TRX": 0.16, "NEAR": 5.4,
-    "OP": 1.9, "INJ": 22, "SEI": 0.42, "ARB": 0.78, "APT": 8.9,
-    "TIA": 6.1, "JUP": 0.85, "WIF": 2.1, "PEPE": 0.0000091, "BNB": 590,
-    "ETC": 26, "FIL": 5.2, "HBAR": 0.075, "ICP": 9.8, "AAVE": 165,
-    "MKR": 1650, "LDO": 1.6, "GALA": 0.024, "SAND": 0.34, "SHIB": 0.000015,
-}
+REFRESH_INTERVAL_SECONDS = 90
 
-# Per-coin, per-exchange-pair base spread (%) - deterministic seed so the
-# table has a realistic-looking mix of positive/negative/near-zero spreads.
-_seed_rng = random.Random(42)
-_MOCK_PAIR_SPREADS = {}
-for _coin in _MOCK_BASE_PRICES:
-    for _a in EXCHANGES:
-        for _b in EXCHANGES:
-            if _a != _b:
-                _MOCK_PAIR_SPREADS[(_coin, _a, _b)] = _seed_rng.uniform(-1.2, 1.2)
+_price_cache = {}   # {coin: {"delta": price_or_missing, "pi42": ..., "coinswitch": ...}}
+_cache_lock = threading.Lock()
+_cache_updated_at = None
+_cache_error = None
+
+
+def _multiplier_strip(raw_symbol):
+    """'1000BONK' -> ('BONK', 1000), '1MBABYDOGE' -> ('BABYDOGE', 1000000),
+    'BTC' -> ('BTC', 1). Needed to convert a quoted contract price back to
+    a true per-unit price before comparing across an exchange that
+    doesn't use the same multiplier-prefix convention."""
+    if raw_symbol.startswith("1000"):
+        return raw_symbol[4:], 1000
+    if raw_symbol.startswith("1M"):
+        return raw_symbol[2:], 1_000_000
+    return raw_symbol, 1
+
+
+def refresh_price_cache():
+    """Fetches current prices from all three exchanges and rebuilds the
+    cache. Only ever called from the background loop below - never from
+    a web request, so a slow Pi42 fetch never makes a page load slow."""
+    global _price_cache, _cache_updated_at, _cache_error
+    try:
+        merged = {}
+
+        delta_data = get_delta_funding_all()
+        for raw_symbol, info in delta_data.items():
+            coin, mult = _multiplier_strip(raw_symbol)
+            price = info.get("price", 0)
+            if price:
+                merged.setdefault(coin, {})["delta"] = price / mult
+
+        pi42_data = get_pi42_funding_all(_FUNDING_COINS)
+        for raw_symbol, info in pi42_data.items():
+            coin, mult = _multiplier_strip(raw_symbol)
+            price = info.get("price", 0)
+            if price:
+                merged.setdefault(coin, {})["pi42"] = price / mult
+
+        cs_data = get_all_funding_rates()
+        for raw_symbol, info in cs_data.items():
+            if not raw_symbol.endswith("USDT"):
+                continue
+            coin = raw_symbol[:-4]
+            price = info.get("mark_price", 0)
+            if price:
+                merged.setdefault(coin, {})["coinswitch"] = float(price)
+
+        with _cache_lock:
+            _price_cache = merged
+            _cache_updated_at = datetime.now()
+            _cache_error = None
+
+        print(f"[spread-scanner] cache refreshed: {len(merged)} coins have at least one price")
+    except Exception as e:
+        with _cache_lock:
+            _cache_error = str(e)
+        print(f"[spread-scanner] price refresh failed: {e}")
+
+
+def spread_background_loop():
+    while True:
+        refresh_price_cache()
+        time.sleep(REFRESH_INTERVAL_SECONDS)
+
+
+def start_spread_background_loop():
+    threading.Thread(target=spread_background_loop, daemon=True).start()
+
+
+def get_cache_status():
+    """Returns (status, error_or_None, age_seconds_or_None).
+    status is one of: 'warming_up', 'live', 'error'."""
+    with _cache_lock:
+        if _cache_updated_at is None:
+            if _cache_error:
+                return "error", _cache_error, None
+            return "warming_up", None, None
+        age = (datetime.now() - _cache_updated_at).total_seconds()
+        return "live", _cache_error, age
 
 
 def get_spread_rows(exchange_a, exchange_b, search="", min_spread=0.0):
     """
     Returns a list of dicts, one per coin:
     {coin, price_a, price_b, diff, spread_pct, last_updated, status}
-
-    Currently mock data. Replace the body of this function with real
-    exchange API calls when live prices are wired in - every caller
-    (page render + JSON endpoint) depends only on this return shape,
-    not on how the numbers were produced.
+    Reads from the in-memory price cache only.
     """
+    with _cache_lock:
+        snapshot = dict(_price_cache)
+        updated_at = _cache_updated_at
+
     rows = []
-    now = datetime.now().strftime("%H:%M:%S")
+    now = updated_at.strftime("%H:%M:%S") if updated_at else "--:--:--"
     search = search.strip().upper()
 
-    for coin, base_price in _MOCK_BASE_PRICES.items():
+    for coin, prices in snapshot.items():
         if search and search not in coin:
             continue
 
-        base_spread_pct = _MOCK_PAIR_SPREADS.get((coin, exchange_a, exchange_b), 0.0)
-        jitter = random.uniform(-0.08, 0.08)
-        spread_pct = base_spread_pct + jitter
+        price_a = prices.get(exchange_a)
+        price_b = prices.get(exchange_b)
+        if not price_a or not price_b:
+            continue
 
-        price_a = base_price
-        price_b = base_price * (1 + spread_pct / 100)
         diff = price_b - price_a
+        spread_pct = (diff / price_a) * 100
 
         if abs(spread_pct) < min_spread:
             continue
@@ -104,6 +193,14 @@ SPREAD_SCANNER_CSS = """
     background:#422006; border:1px solid #92400e; color:#facc15;
     font-size:12px; padding:8px 14px; border-radius:6px; margin-bottom:16px;
   }
+  .live-banner {
+    background:#14532d; border:1px solid #166534; color:#4ade80;
+    font-size:12px; padding:8px 14px; border-radius:6px; margin-bottom:16px;
+  }
+  .error-banner {
+    background:#2d1515; border:1px solid #7f1d1d; color:#f87171;
+    font-size:12px; padding:8px 14px; border-radius:6px; margin-bottom:16px;
+  }
   #spread-tbl thead th { position:sticky; top:0; }
   .status-positive { color:#4ade80; font-weight:700; }
   .status-negative { color:#f87171; font-weight:700; }
@@ -125,7 +222,7 @@ function buildQuery() {
 function renderRows(rows) {
   const tbody = document.querySelector('#spread-tbl tbody');
   if (rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#8b8fa3">No coins match the current filters.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#8b8fa3">No data yet for this pair/filter - either still warming up, or no coins match.</td></tr>';
     return;
   }
   tbody.innerHTML = rows.map(function(r) {
@@ -143,10 +240,27 @@ function renderRows(rows) {
   }).join('');
 }
 
+function updateBanner(status, error, ageSeconds) {
+  const banner = document.getElementById('status-banner');
+  if (status === 'live') {
+    banner.className = 'live-banner';
+    banner.innerHTML = '\ud83d\udfe2 Live data \u00b7 updated ' + Math.round(ageSeconds) + 's ago';
+  } else if (status === 'error') {
+    banner.className = 'error-banner';
+    banner.innerHTML = '\u26a0\ufe0f Price fetch failed: ' + error;
+  } else {
+    banner.className = 'mock-banner';
+    banner.innerHTML = '\u23f3 Fetching real prices for the first time - this can take up to a minute...';
+  }
+}
+
 function refreshData() {
   fetch('/spread-scanner/data?' + buildQuery())
     .then(function(res) { return res.json(); })
-    .then(function(data) { renderRows(data.rows); });
+    .then(function(data) {
+      renderRows(data.rows);
+      updateBanner(data.cache_status, data.cache_error, data.cache_age_seconds);
+    });
 }
 
 function scheduleAutoRefresh() {
@@ -176,7 +290,7 @@ SPREAD_SCANNER_PAGE = """
 
 <h2 style="font-size:18px;margin:0 0 6px;">Spread Arbitrage Scanner</h2>
 <p class="meta">Live price spread between two exchanges for the same coin. Independent of the funding-rate scanner \u2014 no signals, no backtesting, no trade execution.</p>
-<div class="mock-banner">\u26a0\ufe0f Showing placeholder/mock data. Live exchange prices will be connected in a later step.</div>
+<div id="status-banner" class="{banner_class}">{banner_text}</div>
 
 <div class="spread-controls">
   <div><label>Exchange A</label>
@@ -209,7 +323,7 @@ SPREAD_SCANNER_PAGE = """
 
 def _render_rows_html(rows):
     if not rows:
-        return '<tr><td colspan="7" style="text-align:center;color:#8b8fa3">No coins match the current filters.</td></tr>'
+        return '<tr><td colspan="7" style="text-align:center;color:#8b8fa3">No data yet for this pair/filter - either still warming up, or no coins match.</td></tr>'
     html = ""
     for r in rows:
         html += (
@@ -229,6 +343,17 @@ def _render_rows_html(rows):
 def render_spread_scanner_page(base_css, nav_html, exchange_a="delta", exchange_b="pi42",
                                  search="", min_spread=0.0):
     rows = get_spread_rows(exchange_a, exchange_b, search, min_spread)
+    status, error, age = get_cache_status()
+
+    if status == "live":
+        banner_class = "live-banner"
+        banner_text = f"\U0001f7e2 Live data \u00b7 updated {int(age)}s ago"
+    elif status == "error":
+        banner_class = "error-banner"
+        banner_text = f"\u26a0\ufe0f Price fetch failed: {error}"
+    else:
+        banner_class = "mock-banner"
+        banner_text = "\u23f3 Fetching real prices for the first time - this can take up to a minute..."
 
     def options(selected):
         return "".join(
@@ -238,6 +363,7 @@ def render_spread_scanner_page(base_css, nav_html, exchange_a="delta", exchange_
 
     return SPREAD_SCANNER_PAGE.format(
         css=base_css, spread_css=SPREAD_SCANNER_CSS, nav=nav_html,
+        banner_class=banner_class, banner_text=banner_text,
         exchange_a_options=options(exchange_a),
         exchange_b_options=options(exchange_b),
         rows=_render_rows_html(rows),

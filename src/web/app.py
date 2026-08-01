@@ -17,6 +17,12 @@ Runs FOUR background loops, decoupled from each other:
 
 Binds to whatever port HidenCloud/Pterodactyl assigns via the SERVER_PORT
 env var (falls back to 8080 if not set, for local testing).
+
+2026-08-01 fix: spread-scanner routes updated to match spread_scanner.py's
+newer selected_exchanges/limit-based signature (previously still called
+the old exchange_a/exchange_b two-dropdown version, which caused a
+TypeError when the mismatched positional args landed a float in the
+list-slice limit argument).
 """
 import sys
 import threading
@@ -895,14 +901,14 @@ def render_indian_opportunities_page():
 
 
 def render_spread_scanner_route():
-    exchange_a = request.args.get("exchange_a", "delta")
-    exchange_b = request.args.get("exchange_b", "pi42")
+    selected_exchanges = request.args.getlist("exchanges") or ["delta", "pi42", "coinswitch"]
     search = request.args.get("search", "")
     min_spread = float(request.args.get("min_spread", 0) or 0)
+    limit = int(float(request.args.get("limit", 10) or 10))
 
     nav = NAV.format(scanner_active="", backtest_active="", multi_active="",
                      opp_active="", indian_active="", indiaopp_active="", spread_active="active")
-    return render_spread_scanner_page(BASE_CSS, nav, exchange_a, exchange_b, search, min_spread)
+    return render_spread_scanner_page(BASE_CSS, nav, selected_exchanges, search, min_spread, limit)
 
 
 # ── ROUTES ───────────────────────────────────────────────────
@@ -928,11 +934,11 @@ def spread_scanner_route():
 
 @app.route("/spread-scanner/data")
 def spread_scanner_data_route():
-    exchange_a = request.args.get("exchange_a", "delta")
-    exchange_b = request.args.get("exchange_b", "pi42")
+    selected_exchanges = request.args.getlist("exchanges") or ["delta", "pi42", "coinswitch"]
     search = request.args.get("search", "")
     min_spread = float(request.args.get("min_spread", 0) or 0)
-    rows = get_spread_rows(exchange_a, exchange_b, search, min_spread)
+    limit = int(float(request.args.get("limit", 10) or 10))
+    rows = get_spread_rows(selected_exchanges, search, min_spread, limit)
     status, error, age = get_cache_status()
     return jsonify({
         "rows": rows,

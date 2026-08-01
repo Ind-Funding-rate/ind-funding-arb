@@ -55,6 +55,15 @@ actually sends (only raw keys like "delta"/"pi42") - would have shown
 "undefined vs undefined" on every auto-refresh. Fixed by giving the JS
 its own EXCHANGE_LABELS map instead of expecting the server to send
 pre-formatted label strings.
+
+2026-08-01 fix: cache refresh interval dropped from 90s wait-after-fetch
+to 10s. Total cycle time is still floored by Pi42's ~45s websocket
+collection window (that part is unchanged and not a simple config value
+- see PI42_WS_WINDOW_SECONDS) but the old code additionally waited a
+full 90s AFTER each fetch finished before starting the next one, making
+the real-world cycle ~135s end to end. Now it's roughly 45-55s. A true
+sub-10s refresh would need a persistently-open Pi42 websocket instead of
+reconnecting every cycle - noted as separate future work, not done here.
 """
 import asyncio
 import itertools
@@ -71,7 +80,7 @@ from src.data.coinswitch_client import get_all_funding_rates
 EXCHANGES = ["delta", "pi42", "coinswitch"]
 EXCHANGE_LABELS = {"delta": "Delta Exchange", "pi42": "Pi42", "coinswitch": "CoinSwitch"}
 
-REFRESH_INTERVAL_SECONDS = 90
+REFRESH_INTERVAL_SECONDS = 10
 PI42_WS_URL = "wss://fawss.pi42.com/socket.io/?EIO=4&transport=websocket"
 PI42_WS_WINDOW_SECONDS = 45  # matches the funding scanner's own window
 

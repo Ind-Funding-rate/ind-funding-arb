@@ -3,20 +3,23 @@ Standalone, read-only test script - confirms real order-book depth and
 fee data BEFORE any slippage/fee calculation gets built into the Spread
 Scanner. Does not touch spread_scanner.py or any production code.
 
-What this checks:
-1. Delta's L2 order book endpoint for BTCUSD (public, no auth) - trying
-   the documented-by-convention /v2/l2orderbook/{symbol} path.
-2. CoinSwitch futures depth - path is NOT confirmed anywhere in official
-   docs reviewed so far, only their SPOT public depth path is. Tries
-   several plausible futures-namespace variants and reports which ones
-   actually respond, reusing the same Ed25519 signing helper that
-   coinswitch_client.py already has proven working.
-3. CoinSwitch trading fee endpoint - same situation, tries a few
-   plausible paths so we get a REAL fee number instead of guessing one.
+2026-08-01 update: CoinSwitch paths below are now taken directly from
+their official reference docs (api-trading.coinswitch.co/futures/reference/)
+instead of guessed - the earlier guessed paths all returned 404:
+    - Order book: GET /trade/api/v2/futures/order_book
+      params: symbol, exchange=EXCHANGE_2, l2Orderbook=true for depth
+    - Fees: GET /trade/api/v2/futures/instrument_info
+      params: exchange=EXCHANGE_2 -> returns taker_fee_rate/maker_fee_rate
+      PER SYMBOL, so we get CoinSwitch's real fee instead of guessing one.
 
-Run this, read the output, and only then do we build the real feature -
-same pattern that already caught the Pi42 field-name bug and the
-spread-scanner signature mismatch earlier in this project.
+What this checks:
+1. Delta's L2 order book endpoint for BTCUSD (public, no auth).
+2. CoinSwitch futures order book (documented path, both top-of-book and
+   L2 mode) for BTCUSDT.
+3. CoinSwitch futures instrument info (documented path) - confirms real
+   taker/maker fee for BTCUSDT.
+
+Run this, read the output, and only then do we build the real feature.
 """
 import sys
 import json
@@ -52,60 +55,62 @@ def test_delta_orderbook():
         print(f"FAILED: {e}")
 
 
-def test_coinswitch_futures_depth():
+def test_coinswitch_orderbook():
     print("\n" + "=" * 60)
-    print("  COINSWITCH FUTURES DEPTH - trying candidate paths")
+    print("  COINSWITCH FUTURES ORDER BOOK (documented endpoint)")
     print("=" * 60)
-    candidates = [
-        ("/trade/api/v2/futures/depth", {"symbol": "BTCUSDT", "exchange": "EXCHANGE_2"}),
-        ("/trade/api/v2/futures/orderbook", {"symbol": "BTCUSDT", "exchange": "EXCHANGE_2"}),
-        ("/trade/api/v2/futures/market/depth", {"symbol": "BTCUSDT", "exchange": "EXCHANGE_2"}),
-        ("/trade/api/v2/public/depth", {"instrument": "BTC/USDT"}),  # spot-style, long shot for futures
-    ]
-    for path, params in candidates:
+    path = "/trade/api/v2/futures/order_book"
+
+    for label, params in [
+        ("top-of-book", {"symbol": "btcusdt", "exchange": "EXCHANGE_2"}),
+        ("L2 (deep)", {"symbol": "btcusdt", "exchange": "EXCHANGE_2", "l2Orderbook": "true"}),
+    ]:
         try:
             headers, path_with_query = _sign_request("GET", path, params)
             r = requests.get(CS_BASE_URL + path_with_query, headers=headers, timeout=15)
-            print(f"\nPath: {path}")
+            print(f"\nMode: {label}")
             print(f"Status: {r.status_code}")
             if r.status_code == 200:
-                print("SUCCESS - raw response (first 800 chars):")
-                print(json.dumps(r.json(), indent=2)[:800])
+                data = r.json().get("data", {})
+                bids = data.get("bids", [])
+                asks = data.get("asks", [])
+                print(f"Bid levels returned: {len(bids)} (sample: {bids[:3]})")
+                print(f"Ask levels returned: {len(asks)} (sample: {asks[:3]})")
             else:
-                print(f"Body: {r.text[:300]}")
+                print(f"Body: {r.text[:400]}")
         except Exception as e:
-            print(f"Path: {path} -> FAILED: {e}")
+            print(f"Mode: {label} -> FAILED: {e}")
 
 
-def test_coinswitch_fee():
+def test_coinswitch_instrument_info():
     print("\n" + "=" * 60)
-    print("  COINSWITCH TRADING FEE - trying candidate paths")
+    print("  COINSWITCH INSTRUMENT INFO / REAL FEES (documented endpoint)")
     print("=" * 60)
-    candidates = [
-        ("/trade/api/v2/user/trading-fee", {"exchange": "EXCHANGE_2"}),
-        ("/trade/api/v2/futures/trading-fee", {"exchange": "EXCHANGE_2"}),
-        ("/trade/api/v2/futures/fee", {"symbol": "BTCUSDT", "exchange": "EXCHANGE_2"}),
-        ("/trade/api/v2/user/fee", {}),
-    ]
-    for path, params in candidates:
-        try:
-            headers, path_with_query = _sign_request("GET", path, params)
-            r = requests.get(CS_BASE_URL + path_with_query, headers=headers, timeout=15)
-            print(f"\nPath: {path}")
-            print(f"Status: {r.status_code}")
-            if r.status_code == 200:
-                print("SUCCESS - raw response:")
-                print(json.dumps(r.json(), indent=2)[:800])
+    path = "/trade/api/v2/futures/instrument_info"
+    try:
+        headers, path_with_query = _sign_request("GET", path, {"exchange": "EXCHANGE_2"})
+        r = requests.get(CS_BASE_URL + path_with_query, headers=headers, timeout=15)
+        print(f"Status: {r.status_code}")
+        if r.status_code == 200:
+            data = r.json().get("data", {})
+            print(f"Symbols returned: {len(data)}")
+            if "BTCUSDT" in data:
+                btc = data["BTCUSDT"]
+                print(f"BTCUSDT taker_fee_rate: {btc.get('taker_fee_rate')}")
+                print(f"BTCUSDT maker_fee_rate: {btc.get('maker_fee_rate')}")
+                print("Full BTCUSDT entry:", json.dumps(btc, indent=2))
             else:
-                print(f"Body: {r.text[:300]}")
-        except Exception as e:
-            print(f"Path: {path} -> FAILED: {e}")
+                print("BTCUSDT not found. Sample keys:", list(data.keys())[:10])
+        else:
+            print(f"Body: {r.text[:400]}")
+    except Exception as e:
+        print(f"FAILED: {e}")
 
 
 if __name__ == "__main__":
     test_delta_orderbook()
-    test_coinswitch_futures_depth()
-    test_coinswitch_fee()
+    test_coinswitch_orderbook()
+    test_coinswitch_instrument_info()
     print("\n" + "=" * 60)
-    print("  DONE - check which paths returned Status: 200 above")
+    print("  DONE")
     print("=" * 60)

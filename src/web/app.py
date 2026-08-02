@@ -27,6 +27,13 @@ site never stops just to test something new. Restricted to files inside
 this project only (basic path-traversal guard) - reasonable for a
 private single-user tool, not hardened for public multi-user exposure.
 
+2026-08-01 addition - REAL COST on Spread Scanner: the fast price-only
+scan only ever shows a RAW spread. compute_real_cost() (in
+src/data/orderbook_depth.py) fetches LIVE order book depth on demand
+for one coin/pair and walks it for actual fill price + slippage on all
+4 legs of a real round trip, plus confirmed real fees. Purely additive -
+no existing route, page, or background loop touched.
+
 ============================================================
 COORDINATION NOTE (2026-07-31) - both Claude and Codex edit this file
 independently in the same repo, and it's collided repeatedly. Before
@@ -39,6 +46,8 @@ mid-change here. The current, agreed state as of this edit:
   - Spread Scanner (multi-exchange checkbox version) is meant to stay.
   - Test Runner (/admin/test) is meant to stay - it's the fix for the
     "testing stops the live site" problem, don't remove.
+  - Real Cost calculator on Spread Scanner (added 2026-08-01) is meant
+    to stay - live order-book-based fee+slippage detail per row.
 ============================================================
 
 Binds to whatever port HidenCloud/Pterodactyl assigns via the SERVER_PORT
@@ -78,6 +87,7 @@ from src.web.spread_scanner import (
     render_spread_scanner_page, get_spread_rows, get_cache_status,
     start_spread_background_loop, EXCHANGES as SPREAD_EXCHANGES,
 )
+from src.data.orderbook_depth import compute_real_cost
 
 app = Flask(__name__)
 
@@ -113,7 +123,7 @@ KNOWN_TEST_SCRIPTS = [
 INDIAN_EXCHANGE_REGISTRY = [
     {
         "name": "Delta Exchange India", "type": "Derivatives",
-        "inr_deposit": "UPI \u00b7 IMPS \u00b7 NEFT", "futures": True, "pairs": "50+",
+        "inr_deposit": "UPI · IMPS · NEFT", "futures": True, "pairs": "50+",
         "funding_interval": "8 hrs", "api_status": "full", "integration": "live",
         "api_docs": "https://docs.delta.exchange", "fiu_registered": True,
         "notes": "FIU-registered. INR-settled USD pairs.",
@@ -127,7 +137,7 @@ INDIAN_EXCHANGE_REGISTRY = [
     },
     {
         "name": "CoinSwitch PRO", "type": "Derivatives",
-        "inr_deposit": "UPI \u00b7 IMPS \u00b7 NEFT", "futures": True, "pairs": "650+",
+        "inr_deposit": "UPI · IMPS · NEFT", "futures": True, "pairs": "650+",
         "funding_interval": "8 hrs", "api_status": "full", "integration": "live",
         "api_docs": "https://api-trading.coinswitch.co", "fiu_registered": True,
         "notes": "FIU-registered. Ed25519-signed API, confirmed working 2026-07-26.",
@@ -154,11 +164,6 @@ def background_scanner():
 
 
 # ── SHARED STATE: 3-way scanner (Delta + Pi42 + CoinSwitch) ─────
-_three_way_rows = []
-_three_way_last_scan_time = None
-_three_way_error = None
-
-
 def background_three_way_scanner():
     global _three_way_rows, _three_way_last_scan_time, _three_way_error
     while True:
@@ -170,6 +175,11 @@ def background_three_way_scanner():
             _three_way_error = str(e)
             print(f"[web] 3-way scan cycle failed: {e}")
         time.sleep(THREE_WAY_CYCLE_SECONDS)
+
+
+_three_way_rows = []
+_three_way_last_scan_time = None
+_three_way_error = None
 
 
 # ── SHARED STATE: opportunity matrix (ingestion + ranking, decoupled) ──
@@ -236,7 +246,7 @@ def ranking_background():
         time.sleep(RANK_INTERVAL_SECONDS)
 
 
-# ── SHARED PAGE STYLE ────────────────────────────────────────
+# ── SHARED PAGE STYLE ──────────────────────────────
 # Loris Tools-inspired dark terminal theme: JetBrains Mono for all
 # numeric data (fixed-width so decimal points align down a column),
 # Inter for labels/nav, functional heatmap colors (not decorative -
@@ -1082,7 +1092,7 @@ def render_run_test_route():
     )
 
 
-# ── ROUTES ───────────────────────────────────────────────────
+# ── ROUTES ────────────────────────────────────────
 @app.route("/")
 def scanner_route():
     return render_scanner_page()
@@ -1124,6 +1134,20 @@ def spread_scanner_data_route():
         "cache_error": error,
         "cache_age_seconds": age,
     })
+
+
+@app.route("/spread-scanner/real-cost")
+def spread_scanner_real_cost_route():
+    coin = request.args.get("coin", "").upper()
+    exchange_cheap = request.args.get("exchange_cheap", "")
+    exchange_expensive = request.args.get("exchange_expensive", "")
+    position_usd = float(request.args.get("position", 1000) or 1000)
+
+    if not coin or exchange_cheap not in SPREAD_EXCHANGES or exchange_expensive not in SPREAD_EXCHANGES:
+        return jsonify({"error": "Missing or invalid coin/exchange parameters"})
+
+    result = compute_real_cost(coin, exchange_cheap, exchange_expensive, position_usd)
+    return jsonify(result)
 
 
 @app.route("/backtest")

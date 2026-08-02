@@ -26,44 +26,14 @@ Page requests never call an exchange directly - they only ever read the
 in-memory cache built by the background loop, so response time doesn't
 depend on exchange latency.
 
-2026-07-31 fix #1: SPREAD_SCANNER_JS is now a raw string. It contains
-JavaScript's own \\uXXXX escape for an emoji (a UTF-16 surrogate pair,
-valid JS) - without the raw prefix, Python was interpreting that escape
-itself, producing invalid characters that crashed every page load.
-
-2026-07-31 fix #2/#3 (superseded): tried converting Pi42's INR prices to
-USD via a live forex rate. Wrong endpoint caused a silent fallback to a
-stale hardcoded rate, producing a uniform ~+8% "spread" on every coin.
-
-2026-07-31 fix #4: switched Pi42 to its own native USDT-margined market
-instead of INR+conversion - verified live via a standalone test. Delta,
-Pi42, and CoinSwitch are now all queried in native USD/USDT terms, no
-currency conversion, no external FX dependency.
-
-2026-07-31 feature (Nikunj's request): was previously a fixed A-vs-B
-dropdown pair. Now supports selecting ANY 2 or all 3 exchanges via
-checkboxes - for each coin, every pairwise combination among the
-SELECTED exchanges is computed and whichever pair has the largest
-spread for that coin is shown (same "best pair wins" pattern used in
-the 3-way funding-rate scanner). Also added a "show top N" selector
-(10/20/50) so the page shows only the biggest opportunities at a
-glance instead of every coin with any data.
-
-Bug caught before deploy: the JS auto-refresh path referenced
-r.exchange_a_label/r.exchange_b_label, fields the JSON endpoint never
-actually sends (only raw keys like "delta"/"pi42") - would have shown
-"undefined vs undefined" on every auto-refresh. Fixed by giving the JS
-its own EXCHANGE_LABELS map instead of expecting the server to send
-pre-formatted label strings.
-
-2026-08-01 fix: cache refresh interval dropped from 90s wait-after-fetch
-to 10s. Total cycle time is still floored by Pi42's ~45s websocket
-collection window (that part is unchanged and not a simple config value
-- see PI42_WS_WINDOW_SECONDS) but the old code additionally waited a
-full 90s AFTER each fetch finished before starting the next one, making
-the real-world cycle ~135s end to end. Now it's roughly 45-55s. A true
-sub-10s refresh would need a persistently-open Pi42 websocket instead of
-reconnecting every cycle - noted as separate future work, not done here.
+2026-08-01 feature: added a "Real Cost" button per row. The fast scan
+above only ever shows the RAW price gap - no fees, no slippage. Clicking
+Real Cost calls out to src/data/orderbook_depth.py, which fetches LIVE
+order book depth for that one coin/pair on demand and walks it for the
+actual fill price on all 4 legs of a real round trip (open + close),
+plus confirmed real fees. This is deliberately NOT done for all 300+
+coins on every refresh - full depth fetching is much heavier than the
+last-price scan, so it only runs for the one row you click.
 """
 import asyncio
 import itertools
@@ -304,12 +274,21 @@ SPREAD_SCANNER_CSS = """
   .status-negative { color:#f87171; font-weight:700; }
   .status-neutral { color:#8b8fa3; }
   .pair-tag { font-size:11px; color:#8b8fa3; }
+  .detail-btn { background:#2a2d38; color:#e6e6e6; border:none; padding:5px 12px;
+    border-radius:5px; font-size:12px; cursor:pointer; }
+  .detail-btn:hover { background:#3a3d48; }
+  .rc-row { display:flex; justify-content:space-between; padding:6px 0; font-size:13px; }
+  .rc-row span:first-child { color:#8b8fa3; }
+  .rc-leg { display:flex; justify-content:space-between; padding:4px 0;
+    border-bottom:1px dashed #2a2d38; font-size:13px; }
+  .rc-leg span:first-child { color:#8b8fa3; }
 """
 
 SPREAD_SCANNER_JS = r"""
 <script>
 const EXCHANGE_LABELS = {"delta": "Delta Exchange", "pi42": "Pi42", "coinswitch": "CoinSwitch"};
 let autoRefreshTimer = null;
+let lastCoin = null, lastCheap = null, lastExpensive = null;
 
 function buildQuery() {
   const checks = document.querySelectorAll('.exchange-checks input:checked');
@@ -324,13 +303,15 @@ function buildQuery() {
 function renderRows(rows) {
   const tbody = document.querySelector('#spread-tbl tbody');
   if (rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#8b8fa3">No data yet - either still warming up, fewer than 2 exchanges selected, or nothing matches the filter.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#8b8fa3">No data yet - either still warming up, fewer than 2 exchanges selected, or nothing matches the filter.</td></tr>';
     return;
   }
   tbody.innerHTML = rows.map(function(r) {
     const sign = r.diff >= 0 ? '+' : '';
     const pctSign = r.spread_pct >= 0 ? '+' : '';
     const pairLabel = (EXCHANGE_LABELS[r.exchange_a] || r.exchange_a) + ' vs ' + (EXCHANGE_LABELS[r.exchange_b] || r.exchange_b);
+    const cheapEx = r.spread_pct >= 0 ? r.exchange_a : r.exchange_b;
+    const expEx = r.spread_pct >= 0 ? r.exchange_b : r.exchange_a;
     return '<tr>' +
       '<td><b>' + r.coin + '</b></td>' +
       '<td class="pair-tag">' + pairLabel + '</td>' +
@@ -339,6 +320,7 @@ function renderRows(rows) {
       '<td>' + sign + '$' + r.diff.toLocaleString(undefined, {maximumFractionDigits: 8}) + '</td>' +
       '<td class="status-' + r.status + '">' + pctSign + r.spread_pct.toFixed(3) + '%</td>' +
       '<td>' + r.last_updated + '</td>' +
+      '<td><button class="detail-btn" onclick="calculateRealCost(\'' + r.coin + '\',\'' + cheapEx + '\',\'' + expEx + '\')">Real Cost</button></td>' +
     '</tr>';
   }).join('');
 }
@@ -361,7 +343,7 @@ function refreshData() {
   const checks = document.querySelectorAll('.exchange-checks input:checked');
   if (checks.length < 2) {
     document.querySelector('#spread-tbl tbody').innerHTML =
-      '<tr><td colspan="7" style="text-align:center;color:#facc15">Select at least 2 exchanges to compare.</td></tr>';
+      '<tr><td colspan="8" style="text-align:center;color:#facc15">Select at least 2 exchanges to compare.</td></tr>';
     return;
   }
   fetch('/spread-scanner/data?' + buildQuery())
@@ -379,6 +361,51 @@ function scheduleAutoRefresh() {
   }
 }
 
+function calculateRealCost(coin, cheapEx, expEx) {
+  lastCoin = coin; lastCheap = cheapEx; lastExpensive = expEx;
+  const panel = document.getElementById('real-cost-panel');
+  const body = document.getElementById('rc-body');
+  const position = document.getElementById('rc-position').value || 1000;
+  panel.style.display = 'block';
+  document.getElementById('rc-title').innerText = coin + ': ' + EXCHANGE_LABELS[cheapEx] + ' (buy) \u2192 ' + EXCHANGE_LABELS[expEx] + ' (sell) real cost';
+  body.innerHTML = '<div style="color:#8b8fa3">Fetching live order book depth for both exchanges...</div>';
+  panel.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+
+  fetch('/spread-scanner/real-cost?coin=' + coin + '&exchange_cheap=' + cheapEx + '&exchange_expensive=' + expEx + '&position=' + position)
+    .then(function(res) { return res.json(); })
+    .then(renderRealCost);
+}
+
+function renderRealCost(data) {
+  const body = document.getElementById('rc-body');
+  if (data.error) {
+    body.innerHTML = '<div style="color:#f87171">' + data.error + '</div>';
+    return;
+  }
+  const legsHtml = data.legs.map(function(leg) {
+    const warn = leg.fully_filled ? '' : ' <span style="color:#facc15">(not enough visible depth!)</span>';
+    return '<div class="rc-leg">' +
+      '<span>' + leg.label + ' on ' + EXCHANGE_LABELS[leg.exchange] + '</span>' +
+      '<span>avg $' + leg.avg_price.toFixed(6) + ' \u00b7 slippage ' + leg.slippage_pct.toFixed(4) + '%' + warn + '</span>' +
+    '</div>';
+  }).join('');
+
+  const netColor = data.net_pct > 0 ? '#4ade80' : '#f87171';
+  const csNote = (data.cheap_gst_included === null || data.expensive_gst_included === null)
+    ? '<div style="color:#8b8fa3;font-size:11px;margin-top:6px">CoinSwitch fee shown as-is \u2014 GST treatment on their fee is not confirmed, so it is not added on top.</div>'
+    : '';
+  const fillWarning = data.fully_fillable_at_size ? '' :
+    '<div style="color:#facc15;font-size:12px;margin-top:8px">\u26a0\ufe0f Order book does not have enough visible depth to fully fill this position size on all legs \u2014 the real result would be worse than shown.</div>';
+
+  body.innerHTML =
+    '<div style="margin-bottom:10px;">' + legsHtml + '</div>' +
+    '<div class="rc-row"><span>Raw spread</span><span>' + data.raw_spread_pct.toFixed(4) + '%</span></div>' +
+    '<div class="rc-row"><span>Total fees (4 fills)</span><span>-' + data.total_fees_pct.toFixed(4) + '%</span></div>' +
+    '<div class="rc-row"><span>Total slippage (4 fills, real order book)</span><span>-' + data.total_slippage_pct.toFixed(4) + '%</span></div>' +
+    '<div class="rc-row" style="padding-top:10px;font-size:16px;font-weight:700;border-top:1px solid #2a2d38;margin-top:6px;"><span>Net (real)</span><span style="color:' + netColor + '">' + data.net_pct.toFixed(4) + '%</span></div>' +
+    csNote + fillWarning;
+}
+
 document.querySelectorAll('.exchange-checks input').forEach(function(cb) {
   cb.addEventListener('change', refreshData);
 });
@@ -387,6 +414,9 @@ document.getElementById('min-spread').addEventListener('input', refreshData);
 document.getElementById('spread-limit').addEventListener('change', refreshData);
 document.getElementById('refresh-btn').addEventListener('click', refreshData);
 document.getElementById('auto-refresh').addEventListener('change', scheduleAutoRefresh);
+document.getElementById('rc-recalc').addEventListener('click', function() {
+  if (lastCoin) calculateRealCost(lastCoin, lastCheap, lastExpensive);
+});
 
 scheduleAutoRefresh();
 </script>
@@ -402,7 +432,7 @@ SPREAD_SCANNER_PAGE = """
 <h2 style="font-size:18px;margin:0 0 6px;">Spread Arbitrage Scanner</h2>
 <p class="meta">Live price spread between exchanges for the same coin. Independent of the funding-rate scanner \u2014 no signals, no backtesting, no trade execution.</p>
 <div id="status-banner" class="{banner_class}">{banner_text}</div>
-<p class="fx-note">All prices are each exchange's own native USD/USDT market \u2014 Delta USD, Pi42's USDT market (not INR), CoinSwitch USDT. No currency conversion involved.</p>
+<p class="fx-note">All prices are each exchange's own native USD/USDT market \u2014 Delta USD, Pi42's USDT market (not INR), CoinSwitch USDT. No currency conversion involved. The table below shows raw price gap only \u2014 click \u201cReal Cost\u201d on any row for actual fees + live order-book slippage.</p>
 
 <div class="spread-controls">
   <div><label>Exchanges to compare (pick 2 or all 3)</label>
@@ -424,10 +454,22 @@ SPREAD_SCANNER_PAGE = """
 <table id="spread-tbl">
 <thead><tr>
   <th>Coin</th><th>Best Pair</th><th>Price A (USD)</th><th>Price B (USD)</th>
-  <th>Price Diff</th><th>Spread %</th><th>Last Updated</th>
+  <th>Price Diff</th><th>Spread %</th><th>Last Updated</th><th>Real Cost</th>
 </tr></thead>
 <tbody>{rows}</tbody>
 </table>
+
+<div id="real-cost-panel" style="display:none; margin-top:24px; background:#1a1d27; border:1px solid #2a2d38; border-radius:10px; padding:20px;">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; flex-wrap:wrap; gap:10px;">
+    <h3 id="rc-title" style="font-size:15px; margin:0;"></h3>
+    <div>
+      <label style="display:inline;font-size:12px;color:#8b8fa3;">Position size ($)</label>
+      <input id="rc-position" type="number" value="1000" style="width:100px; margin-left:6px;">
+      <button id="rc-recalc" type="button" style="margin-left:6px;">Recalculate</button>
+    </div>
+  </div>
+  <div id="rc-body"></div>
+</div>
 
 {js}
 </body></html>
@@ -436,10 +478,12 @@ SPREAD_SCANNER_PAGE = """
 
 def _render_rows_html(rows):
     if not rows:
-        return '<tr><td colspan="7" style="text-align:center;color:#8b8fa3">No data yet - either still warming up, fewer than 2 exchanges selected, or nothing matches the filter.</td></tr>'
+        return '<tr><td colspan="8" style="text-align:center;color:#8b8fa3">No data yet - either still warming up, fewer than 2 exchanges selected, or nothing matches the filter.</td></tr>'
     html = ""
     for r in rows:
         pair_label = f"{EXCHANGE_LABELS[r['exchange_a']]} vs {EXCHANGE_LABELS[r['exchange_b']]}"
+        cheap_ex = r["exchange_a"] if r["spread_pct"] >= 0 else r["exchange_b"]
+        exp_ex = r["exchange_b"] if r["spread_pct"] >= 0 else r["exchange_a"]
         html += (
             f"<tr>"
             f"<td><b>{r['coin']}</b></td>"
@@ -449,6 +493,7 @@ def _render_rows_html(rows):
             f"<td>{r['diff']:+,.8f}</td>"
             f"<td class='status-{r['status']}'>{r['spread_pct']:+.3f}%</td>"
             f"<td>{r['last_updated']}</td>"
+            f"<td><button class='detail-btn' onclick=\"calculateRealCost('{r['coin']}','{cheap_ex}','{exp_ex}')\">Real Cost</button></td>"
             f"</tr>"
         )
     return html

@@ -1,9 +1,10 @@
 """
-Minimal web dashboard - 9 pages: live scanner, Indian exchanges overview,
+Minimal web dashboard - 10 pages: live scanner, Indian exchanges overview,
 Indian opportunities (Delta+Pi42+CoinSwitch), Indian backtest, spread
 arbitrage scanner (independent module), Delta/Pi42 backtest (our own
-logged data), multi-exchange historical backtest, and an automated
-opportunity matrix scanner across ALL available coins x exchange pairs.
+logged data), multi-exchange historical backtest, an automated
+opportunity matrix scanner across ALL available coins x exchange pairs,
+and a Test Runner (see below).
 
 Runs FIVE background loops, decoupled from each other:
 1. Live full-market scanner (Delta vs Pi42, 133 coins, every ~90s)
@@ -16,26 +17,35 @@ Runs FIVE background loops, decoupled from each other:
 5. Spread scanner price cache: independent Delta/Pi42(USDT market)/
    CoinSwitch price refresh, every 90s.
 
+2026-08-01 addition - TEST RUNNER (/admin/test): every time a new
+module got tested tonight by temporarily pointing HidenCloud's APP_PY_FILE
+at it, this whole website (all 5 background loops above, live scanning,
+alerts) went down for the duration - a real recurring problem, requested
+to be fixed. The Test Runner solves this by running a chosen script as a
+SEPARATE subprocess from inside this always-running app.py, so the live
+site never stops just to test something new. Restricted to files inside
+this project only (basic path-traversal guard) - reasonable for a
+private single-user tool, not hardened for public multi-user exposure.
+
 ============================================================
 COORDINATION NOTE (2026-07-31) - both Claude and Codex edit this file
-independently in the same repo, and it's collided repeatedly (each
-overwriting the other's changes without knowing - most recently, both
-independently fixed the same spread-scanner route bug within minutes
-of each other). Before editing this file, check with Nikunj whether
-the other AI is also mid-change here. The current, agreed state as of
-this edit:
+independently in the same repo, and it's collided repeatedly. Before
+editing this file, check with Nikunj whether the other AI is also
+mid-change here. The current, agreed state as of this edit:
   - CoinSwitch IS integrated (3-way scanner + Indian Opportunities/
-    Backtest pages) - do not remove without asking first, it was
-    verified working with real data.
+    Backtest pages) - do not remove without asking first.
   - Visual theme is the Loris Tools-inspired dark terminal redesign
     (BASE_CSS below) - do not silently revert to a plainer theme.
   - Spread Scanner (multi-exchange checkbox version) is meant to stay.
+  - Test Runner (/admin/test) is meant to stay - it's the fix for the
+    "testing stops the live site" problem, don't remove.
 ============================================================
 
 Binds to whatever port HidenCloud/Pterodactyl assigns via the SERVER_PORT
 env var (falls back to 8080 if not set, for local testing).
 """
 import sys
+import subprocess
 import threading
 import time
 import json as pyjson
@@ -44,6 +54,7 @@ from datetime import datetime
 import os
 
 sys.path.append(str(Path(__file__).resolve().parents[2]))
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 from flask import Flask, request, redirect, jsonify
 from dotenv import load_dotenv
@@ -83,6 +94,21 @@ INGEST_INTERVAL_SECONDS = 30 * 60
 RANK_INTERVAL_SECONDS   = 5 * 60
 BACKTEST_DAYS_DEFAULT   = 14
 POSITION_DEFAULT        = 1000
+
+# Known scripts with their own standalone self-tests, built up over
+# tonight's work - shown as quick-pick buttons on the Test Runner page.
+# The free-text box below them accepts ANY .py path inside the project,
+# so this list is just a convenience, not a restriction.
+KNOWN_TEST_SCRIPTS = [
+    "src/storage/manager.py",
+    "src/storage/metadata_store.py",
+    "src/data/duckdb_writer.py",
+    "src/data/duckdb_reader.py",
+    "src/data/delta_market_data.py",
+    "src/data/coin_discovery.py",
+    "src/data/market_data_store.py",
+    "src/data/coinswitch_client.py",
+]
 
 INDIAN_EXCHANGE_REGISTRY = [
     {
@@ -313,6 +339,15 @@ BASE_CSS = """
   .spread-track { width:52px; height:5px; background:var(--border-soft); border-radius:3px;
                    overflow:hidden; flex-shrink:0; }
   .spread-fill { display:block; height:100%; border-radius:3px; }
+  .test-btn { display:inline-block; background:var(--panel); border:1px solid var(--border);
+              color:var(--text); padding:8px 14px; border-radius:6px; font-size:12.5px;
+              font-family:'JetBrains Mono', monospace; text-decoration:none; margin:0 8px 8px 0; }
+  .test-btn:hover { border-color:var(--accent); color:var(--accent); }
+  pre.test-output { background:#000; color:#B8E6C9; border:1px solid var(--border);
+                     border-radius:8px; padding:16px; font-family:'JetBrains Mono', monospace;
+                     font-size:12.5px; line-height:1.6; overflow-x:auto; white-space:pre-wrap;
+                     word-break:break-word; max-height:600px; overflow-y:auto; }
+  pre.test-output .stderr { color:#FF8A8A; }
 """
 
 NAV = """
@@ -326,11 +361,12 @@ NAV = """
   <a href="/backtest" class="{backtest_active}">Backtest (2-way)</a>
   <a href="/multi-backtest" class="{multi_active}">Backtest (global)</a>
   <a href="/opportunities" class="{opp_active}">Opportunities (global)</a>
+  <a href="/admin/test" class="{testrunner_active}">\U0001f9ea Test Runner</a>
 </header>
 """
 
 def nav_html(active):
-    keys = ["scanner", "indian", "indiaopp", "indiabt", "spread", "backtest", "multi", "opp"]
+    keys = ["scanner", "indian", "indiaopp", "indiabt", "spread", "backtest", "multi", "opp", "testrunner"]
     return NAV.format(**{f"{k}_active": ("active" if k == active else "") for k in keys})
 
 
@@ -597,6 +633,35 @@ INDIAN_BACKTEST_PAGE = """
   <button type="submit">Run backtest</button>
 </form>
 {result_html}
+</body></html>
+"""
+
+TEST_RUNNER_PAGE = """
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Test Runner \u2014 Funding Arb</title>
+<style>{css}</style></head><body>
+{nav}
+<h2 style="font-size:18px;margin:0 0 6px;">\U0001f9ea Test Runner</h2>
+<p class="note" style="margin-bottom:20px;max-width:680px">
+  Runs any script in this project as a <b>separate process</b>, without stopping the
+  live website. The scanners, alerts, and every other page above keep running the
+  whole time - this is what fixes the old problem where testing something new meant
+  the entire site going offline until you switched the settings back.
+</p>
+
+<div class="section-title">QUICK PICKS (scripts with their own self-tests)</div>
+<div style="margin-bottom:24px">{quick_pick_buttons}</div>
+
+<form method="get" action="/admin/run-test">
+  <div style="flex:1;min-width:280px">
+    <label>Script path (inside this project)</label>
+    <input name="module" value="{module}" style="width:100%" placeholder="e.g. src/data/duckdb_writer.py">
+  </div>
+  <button type="submit">Run</button>
+</form>
+
+{output_html}
 </body></html>
 """
 
@@ -942,6 +1007,81 @@ def render_spread_scanner_route():
     )
 
 
+def _validate_test_script_path(module: str):
+    """Basic path-traversal guard: resolves the requested path and
+    confirms it's still inside the project directory and is a .py file.
+    Returns the safe absolute path, or None if the request is invalid.
+    Reasonable for a private single-user tool - not hardened against a
+    malicious multi-user public deployment."""
+    if not module or not module.endswith(".py"):
+        return None
+    candidate = (PROJECT_ROOT / module).resolve()
+    try:
+        candidate.relative_to(PROJECT_ROOT)
+    except ValueError:
+        return None
+    if not candidate.exists():
+        return None
+    return candidate
+
+
+def render_test_runner_page():
+    module = request.args.get("module", "")
+    quick_picks = "".join(
+        f'<a class="test-btn" href="/admin/run-test?module={s}">{s.split("/")[-1]}</a>'
+        for s in KNOWN_TEST_SCRIPTS
+    )
+    return TEST_RUNNER_PAGE.format(
+        css=BASE_CSS, nav=nav_html("testrunner"),
+        quick_pick_buttons=quick_picks, module=module, output_html="",
+    )
+
+
+def render_run_test_route():
+    module = request.args.get("module", "")
+    quick_picks = "".join(
+        f'<a class="test-btn" href="/admin/run-test?module={s}">{s.split("/")[-1]}</a>'
+        for s in KNOWN_TEST_SCRIPTS
+    )
+
+    path = _validate_test_script_path(module)
+    if path is None:
+        output_html = (
+            '<div class="note" style="color:#FF4757">'
+            'Invalid path - must be a .py file inside this project.</div>'
+        )
+    else:
+        # Runs as a SEPARATE subprocess - this app.py process (and every
+        # background thread above: live scanners, alerts, ingestion)
+        # keeps running the whole time, completely unaffected.
+        try:
+            result = subprocess.run(
+                [sys.executable, str(path)],
+                capture_output=True, text=True, timeout=90, cwd=str(PROJECT_ROOT),
+            )
+            output = result.stdout
+            if result.stderr:
+                output += f"\n<span class='stderr'>{result.stderr}</span>"
+            exit_note = (
+                f"\n\n--- exit code: {result.returncode} "
+                f"({'OK' if result.returncode == 0 else 'FAILED'}) ---"
+            )
+            output_html = f'<pre class="test-output">{output}{exit_note}</pre>'
+        except subprocess.TimeoutExpired:
+            output_html = (
+                '<div class="note" style="color:#FF4757">'
+                'Timed out after 90 seconds - this script may run continuously '
+                '(a loop) rather than being a one-shot test.</div>'
+            )
+        except Exception as e:
+            output_html = f'<div class="note" style="color:#FF4757">Failed to run: {e}</div>'
+
+    return TEST_RUNNER_PAGE.format(
+        css=BASE_CSS, nav=nav_html("testrunner"),
+        quick_pick_buttons=quick_picks, module=module, output_html=output_html,
+    )
+
+
 # ── ROUTES ───────────────────────────────────────────────────
 @app.route("/")
 def scanner_route():
@@ -1006,6 +1146,16 @@ def opportunities_rescan_route():
     if not _opp_running:
         threading.Thread(target=run_ranking_pass, daemon=True).start()
     return redirect("/opportunities")
+
+
+@app.route("/admin/test")
+def test_runner_route():
+    return render_test_runner_page()
+
+
+@app.route("/admin/run-test")
+def run_test_route():
+    return render_run_test_route()
 
 
 if __name__ == "__main__":

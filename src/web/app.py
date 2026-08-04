@@ -17,22 +17,38 @@ Runs FIVE background loops, decoupled from each other:
 5. Spread scanner price cache: independent Delta/Pi42(USDT market)/
    CoinSwitch price refresh, every 90s.
 
-2026-08-01 addition - TEST RUNNER (/admin/test): every time a new
-module got tested tonight by temporarily pointing HidenCloud's APP_PY_FILE
-at it, this whole website (all 5 background loops above, live scanning,
-alerts) went down for the duration - a real recurring problem, requested
-to be fixed. The Test Runner solves this by running a chosen script as a
-SEPARATE subprocess from inside this always-running app.py, so the live
-site never stops just to test something new. Restricted to files inside
-this project only (basic path-traversal guard) - reasonable for a
-private single-user tool, not hardened for public multi-user exposure.
+TEST RUNNER (/admin/test): runs a chosen script as a SEPARATE subprocess
+from inside this always-running app.py, so the live site never stops
+just to test something new. Restricted to files inside this project
+only (basic path-traversal guard) - reasonable for a private
+single-user tool, not hardened for public multi-user exposure.
 
-2026-08-01 addition - REAL COST on Spread Scanner: the fast price-only
-scan only ever shows a RAW spread. compute_real_cost() (in
-src/data/orderbook_depth.py) fetches LIVE order book depth on demand
-for one coin/pair and walks it for actual fill price + slippage on all
-4 legs of a real round trip, plus confirmed real fees. Purely additive -
-no existing route, page, or background loop touched.
+REAL COST (Spread Scanner): the fast price-only scan only ever shows a
+RAW spread. compute_real_cost() (in src/data/orderbook_depth.py)
+fetches LIVE order book depth on demand for one coin/pair and walks it
+for actual fill price + slippage on all 4 legs of a real round trip,
+plus confirmed real fees.
+
+2026-08-01 addition - REAL COST on funding-rate pages (Scanner, Indian
+Opportunities): the SAME compute_real_cost() function, reused here for
+a different purpose. For a price-spread trade, "cheap"/"expensive" is
+about which side has the lower/higher PRICE. For a funding-rate hedge,
+it means something different: "cheap" = the exchange with the LOWER
+funding rate (go long/buy there), "expensive" = the exchange with the
+HIGHER funding rate (go short/sell there) - that direction is what
+actually captures the funding differential. The function itself doesn't
+care why you picked a direction, it just walks the real order book for
+whichever two exchanges + direction it's given, so no changes to
+orderbook_depth.py or the /spread-scanner/real-cost endpoint were
+needed - only new server-side logic here to compute the RIGHT direction
+for a funding trade instead of a price trade, and a relabeled panel
+("execution cost", not "buy cheap/sell expensive") to avoid confusing
+the two concepts. IMPORTANT: this panel shows EXECUTION cost only (fees
++ slippage to open AND close) - it does NOT include the funding payments
+themselves, which accrue over however many periods you hold the
+position. The two numbers are meant to be compared, not merged - the
+main table's Net % already includes funding minus fees; this panel adds
+the slippage piece that Net % was missing, as its own separate number.
 
 ============================================================
 COORDINATION NOTE (2026-07-31) - both Claude and Codex edit this file
@@ -46,8 +62,8 @@ mid-change here. The current, agreed state as of this edit:
   - Spread Scanner (multi-exchange checkbox version) is meant to stay.
   - Test Runner (/admin/test) is meant to stay - it's the fix for the
     "testing stops the live site" problem, don't remove.
-  - Real Cost calculator on Spread Scanner (added 2026-08-01) is meant
-    to stay - live order-book-based fee+slippage detail per row.
+  - Real Cost calculator - now present on Spread Scanner, Scanner, AND
+    Indian Opportunities (added 2026-08-01) - meant to stay on all three.
 ============================================================
 
 Binds to whatever port HidenCloud/Pterodactyl assigns via the SERVER_PORT
@@ -105,10 +121,30 @@ RANK_INTERVAL_SECONDS   = 5 * 60
 BACKTEST_DAYS_DEFAULT   = 14
 POSITION_DEFAULT        = 1000
 
-# Known scripts with their own standalone self-tests, built up over
-# tonight's work - shown as quick-pick buttons on the Test Runner page.
-# The free-text box below them accepts ANY .py path inside the project,
-# so this list is just a convenience, not a restriction.
+# Maps three_way_scanner's "best_pair" string to the two raw exchange
+# keys orderbook_depth.py expects.
+PAIR_TO_EXCHANGES = {
+    "Delta-Pi42": ("delta", "pi42"),
+    "Delta-CoinSwitch": ("delta", "coinswitch"),
+    "Pi42-CoinSwitch": ("pi42", "coinswitch"),
+}
+RATE_FIELD = {
+    "delta": "delta_funding_pct",
+    "pi42": "pi42_funding_pct",
+    "coinswitch": "coinswitch_funding_pct",
+}
+
+
+def funding_trade_direction(exchange_a, rate_a, exchange_b, rate_b):
+    """For a funding-rate hedge: go LONG (buy) on whichever exchange has
+    the LOWER rate, SHORT (sell) on whichever has the HIGHER rate - that
+    direction is what captures the funding differential. Returns
+    (long_exchange, short_exchange)."""
+    if rate_a <= rate_b:
+        return exchange_a, exchange_b
+    return exchange_b, exchange_a
+
+
 KNOWN_TEST_SCRIPTS = [
     "src/storage/manager.py",
     "src/storage/metadata_store.py",
@@ -144,7 +180,6 @@ INDIAN_EXCHANGE_REGISTRY = [
     },
 ]
 
-# ── SHARED STATE: live scanner (Delta vs Pi42) ─────────────────
 _latest_rows = []
 _last_scan_time = None
 _scan_error = None
@@ -163,7 +198,6 @@ def background_scanner():
         time.sleep(CYCLE_SECONDS)
 
 
-# ── SHARED STATE: 3-way scanner (Delta + Pi42 + CoinSwitch) ─────
 def background_three_way_scanner():
     global _three_way_rows, _three_way_last_scan_time, _three_way_error
     while True:
@@ -181,8 +215,6 @@ _three_way_rows = []
 _three_way_last_scan_time = None
 _three_way_error = None
 
-
-# ── SHARED STATE: opportunity matrix (ingestion + ranking, decoupled) ──
 _opp_coin_universe = []
 _ingest_running = False
 _ingest_progress = (0, 0)
@@ -246,11 +278,6 @@ def ranking_background():
         time.sleep(RANK_INTERVAL_SECONDS)
 
 
-# ── SHARED PAGE STYLE ──────────────────────────────
-# Loris Tools-inspired dark terminal theme: JetBrains Mono for all
-# numeric data (fixed-width so decimal points align down a column),
-# Inter for labels/nav, functional heatmap colors (not decorative -
-# green/red/amber carry real meaning about profitability).
 BASE_CSS = """
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&display=swap');
   :root {
@@ -358,6 +385,17 @@ BASE_CSS = """
                      font-size:12.5px; line-height:1.6; overflow-x:auto; white-space:pre-wrap;
                      word-break:break-word; max-height:600px; overflow-y:auto; }
   pre.test-output .stderr { color:#FF8A8A; }
+  .detail-btn { background:var(--panel); color:var(--text); border:1px solid var(--border);
+                padding:6px 13px; border-radius:5px; font-size:11.5px; cursor:pointer;
+                font-family:'Inter',sans-serif; font-weight:600; }
+  .detail-btn:hover { border-color:var(--accent); color:var(--accent); }
+  .rc-panel { display:none; margin-top:24px; background:var(--panel); border:1px solid var(--border);
+              border-radius:10px; padding:20px; }
+  .rc-row { display:flex; justify-content:space-between; padding:6px 0; font-size:13px; }
+  .rc-row span:first-child { color:var(--muted-2); }
+  .rc-leg { display:flex; justify-content:space-between; padding:4px 0;
+            border-bottom:1px dashed var(--border-soft); font-size:13px; }
+  .rc-leg span:first-child { color:var(--muted-2); }
 """
 
 NAV = """
@@ -390,6 +428,85 @@ def spread_bar(net_pct, css_class, max_scale=0.3):
         f'style="width:{pct_width:.0f}%;background:{color};"></span></span>'
         f'</span>'
     )
+
+
+# ── Real Cost panel + JS, shared by Scanner and Indian Opportunities ──
+# (Spread Scanner has its own copy - tightly bound to that page's own
+# element IDs/table - this is a fresh copy scoped for these two pages,
+# both hitting the SAME generic /spread-scanner/real-cost endpoint.
+# Labeled "execution cost" here rather than "buy cheap/sell expensive",
+# since for a funding trade the direction is about rate, not price, and
+# conflating the two would be misleading.)
+REAL_COST_PANEL_HTML = """
+<div id="real-cost-panel" class="rc-panel">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; flex-wrap:wrap; gap:10px;">
+    <h3 id="rc-title" style="font-size:15px; margin:0;"></h3>
+    <div>
+      <label style="display:inline;font-size:12px;color:var(--muted-2);">Position size ($)</label>
+      <input id="rc-position" type="number" value="1000" style="width:100px; margin-left:6px;">
+      <button id="rc-recalc" type="button" style="margin-left:6px;">Recalculate</button>
+    </div>
+  </div>
+  <p class="note" style="margin:0 0 12px;">Execution cost only (fees + real order-book slippage to open AND close). Compare this against the funding you'd expect to collect over your holding period - it is not merged into one number here since funding accrues over time and this is a one-time entry/exit cost.</p>
+  <div id="rc-body"></div>
+</div>
+"""
+
+REAL_COST_JS = r"""
+<script>
+const RC_LABELS = {"delta": "Delta Exchange", "pi42": "Pi42", "coinswitch": "CoinSwitch"};
+let rcLastCoin = null, rcLastLong = null, rcLastShort = null;
+
+function calculateRealCost(coin, longEx, shortEx) {
+  rcLastCoin = coin; rcLastLong = longEx; rcLastShort = shortEx;
+  const panel = document.getElementById('real-cost-panel');
+  const body = document.getElementById('rc-body');
+  const position = document.getElementById('rc-position').value || 1000;
+  panel.style.display = 'block';
+  document.getElementById('rc-title').innerText = coin + ': Long ' + RC_LABELS[longEx] + ' / Short ' + RC_LABELS[shortEx] + ' \u2014 execution cost';
+  body.innerHTML = '<div style="color:var(--muted-2)">Fetching live order book depth for both exchanges...</div>';
+  panel.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+
+  fetch('/spread-scanner/real-cost?coin=' + coin + '&exchange_cheap=' + longEx + '&exchange_expensive=' + shortEx + '&position=' + position)
+    .then(function(res) { return res.json(); })
+    .then(renderRealCost);
+}
+
+function renderRealCost(data) {
+  const body = document.getElementById('rc-body');
+  if (data.error) {
+    body.innerHTML = '<div style="color:#FF4757">' + data.error + '</div>';
+    return;
+  }
+  const legsHtml = data.legs.map(function(leg) {
+    const warn = leg.fully_filled ? '' : ' <span style="color:var(--near)">(not enough visible depth!)</span>';
+    return '<div class="rc-leg">' +
+      '<span>' + leg.label + ' on ' + RC_LABELS[leg.exchange] + '</span>' +
+      '<span>avg $' + leg.avg_price.toFixed(6) + ' \u00b7 slippage ' + leg.slippage_pct.toFixed(4) + '%' + warn + '</span>' +
+    '</div>';
+  }).join('');
+
+  const netColor = data.net_pct > 0 ? 'var(--profit)' : 'var(--loss)';
+  const csNote = (data.cheap_gst_included === null || data.expensive_gst_included === null)
+    ? '<div style="color:var(--muted-2);font-size:11px;margin-top:6px">CoinSwitch fee shown as-is \u2014 GST treatment on their fee is not confirmed, so it is not added on top.</div>'
+    : '';
+  const fillWarning = data.fully_fillable_at_size ? '' :
+    '<div style="color:var(--near);font-size:12px;margin-top:8px">\u26a0\ufe0f Order book does not have enough visible depth to fully fill this position size on all legs \u2014 the real result would be worse than shown.</div>';
+
+  body.innerHTML =
+    '<div style="margin-bottom:10px;">' + legsHtml + '</div>' +
+    '<div class="rc-row"><span>Entry price gap (long vs short, at best price)</span><span>' + data.raw_spread_pct.toFixed(4) + '%</span></div>' +
+    '<div class="rc-row"><span>Total fees (4 fills)</span><span>-' + data.total_fees_pct.toFixed(4) + '%</span></div>' +
+    '<div class="rc-row"><span>Total slippage (4 fills, real order book)</span><span>-' + data.total_slippage_pct.toFixed(4) + '%</span></div>' +
+    '<div class="rc-row" style="padding-top:10px;font-size:16px;font-weight:700;border-top:1px solid var(--border);margin-top:6px;"><span>Net execution cost</span><span style="color:' + netColor + '">' + data.net_pct.toFixed(4) + '%</span></div>' +
+    csNote + fillWarning;
+}
+
+document.getElementById('rc-recalc').addEventListener('click', function() {
+  if (rcLastCoin) calculateRealCost(rcLastCoin, rcLastLong, rcLastShort);
+});
+</script>
+"""
 
 SCANNER_JS = """
 <script>
@@ -436,10 +553,13 @@ SCANNER_PAGE = """
   <th onclick="sortTable(3,true)">Gap pp</th>
   <th onclick="sortTable(4,true)">Net %</th>
   <th onclick="sortTable(5,true)">Delta Vol ($)</th>
+  <th>Real Cost</th>
 </tr></thead>
 <tbody>{rows}</tbody>
 </table>
+{real_cost_panel}
 {js}
+{real_cost_js}
 </body></html>
 """
 
@@ -620,8 +740,12 @@ INDIAN_OPPORTUNITIES_PAGE = """
 <div class="note" style="margin-top:24px;max-width:680px">
   <b>How this works:</b> for each coin, all 3 possible pairs are checked and whichever has
   the best net% after ITS OWN real fees wins. Page auto-refreshes every 90 seconds.
+  Click \u201cReal Cost\u201d on any row to check actual execution cost using live order book
+  depth before relying on the raw net% above.
 </div>
+{real_cost_panel}
 <script>setTimeout(()=>location.reload(), 92000);</script>
+{real_cost_js}
 </body></html>
 """
 
@@ -659,10 +783,8 @@ TEST_RUNNER_PAGE = """
   whole time - this is what fixes the old problem where testing something new meant
   the entire site going offline until you switched the settings back.
 </p>
-
 <div class="section-title">QUICK PICKS (scripts with their own self-tests)</div>
 <div style="margin-bottom:24px">{quick_pick_buttons}</div>
-
 <form method="get" action="/admin/run-test">
   <div style="flex:1;min-width:280px">
     <label>Script path (inside this project)</label>
@@ -670,7 +792,6 @@ TEST_RUNNER_PAGE = """
   </div>
   <button type="submit">Run</button>
 </form>
-
 {output_html}
 </body></html>
 """
@@ -699,6 +820,7 @@ def render_scanner_page():
         else:
             cls = "loss"
         thin_badge = '<span class="thin">thin</span>' if r["delta_volume_usd"] < LOW_LIQUIDITY_USD else ""
+        long_ex, short_ex = funding_trade_direction("delta", r["delta_funding_pct"], "pi42", r["pi42_funding_pct"])
         rows_html += (
             f"<tr data-coin='{r['coin'].lower()}'>"
             f"<td><a class='coin-link' href='/backtest?coin={r['coin']}'>{r['coin']}</a>{thin_badge}</td>"
@@ -706,12 +828,17 @@ def render_scanner_page():
             f"<td>{r['pi42_funding_pct']:.5f}</td>"
             f"<td>{r['gap_pct']:.5f}</td>"
             f"<td>{spread_bar(r['net_pct'], cls)}</td>"
-            f"<td>{r['delta_volume_usd']:,.0f}</td></tr>"
+            f"<td>{r['delta_volume_usd']:,.0f}</td>"
+            f"<td><button class='detail-btn' onclick=\"calculateRealCost('{r['coin']}','{long_ex}','{short_ex}')\">Real Cost</button></td>"
+            f"</tr>"
         )
     if not rows_html:
-        rows_html = "<tr><td colspan='6'>No data yet.</td></tr>"
+        rows_html = "<tr><td colspan='7'>No data yet.</td></tr>"
 
-    return SCANNER_PAGE.format(css=BASE_CSS, nav=nav_html("scanner"), status_line=status, rows=rows_html, js=SCANNER_JS)
+    return SCANNER_PAGE.format(
+        css=BASE_CSS, nav=nav_html("scanner"), status_line=status, rows=rows_html,
+        js=SCANNER_JS, real_cost_panel=REAL_COST_PANEL_HTML, real_cost_js=REAL_COST_JS,
+    )
 
 
 def render_backtest_page():
@@ -907,6 +1034,18 @@ def render_indian_opportunities_page():
     def rate_or_na(v):
         return f"{v}%" if v != "" else "N/A"
 
+    def real_cost_button(r):
+        pair = PAIR_TO_EXCHANGES.get(r["best_pair"])
+        if not pair:
+            return ""
+        ex1, ex2 = pair
+        rate1 = r[RATE_FIELD[ex1]]
+        rate2 = r[RATE_FIELD[ex2]]
+        if rate1 == "" or rate2 == "":
+            return ""
+        long_ex, short_ex = funding_trade_direction(ex1, rate1, ex2, rate2)
+        return f"<td><button class='detail-btn' onclick=\"calculateRealCost('{r['coin']}','{long_ex}','{short_ex}')\">Real Cost</button></td>"
+
     if profitable:
         p_rows = ""
         for r in sorted(profitable, key=lambda r: r["net_pct"], reverse=True):
@@ -919,13 +1058,14 @@ def render_indian_opportunities_page():
                 f"<td>{rate_or_na(r['coinswitch_funding_pct'])}</td>"
                 f"<td>{r['gap_pct']:.5f}%</td>"
                 f"<td>{spread_bar(r['net_pct'], 'profit')}</td>"
-                f"<td class='profit'>{apy_est:+.1f}%</td></tr>"
+                f"<td class='profit'>{apy_est:+.1f}%</td>"
+                f"{real_cost_button(r)}</tr>"
             )
         profitable_section = f"""
         <div class="section-title">\U0001f7e2 PROFITABLE OPPORTUNITIES ({profitable_count})</div>
         <table><thead><tr>
           <th>Coin</th><th>Best Pair</th><th>Delta %</th><th>Pi42 %</th><th>CoinSwitch %</th>
-          <th>Gap %</th><th>Net %</th><th>Est. APY</th>
+          <th>Gap %</th><th>Net %</th><th>Est. APY</th><th>Real Cost</th>
         </tr></thead><tbody>{p_rows}</tbody></table>
         """
     else:
@@ -947,13 +1087,14 @@ def render_indian_opportunities_page():
                 f"<td>{rate_or_na(r['pi42_funding_pct'])}</td>"
                 f"<td>{rate_or_na(r['coinswitch_funding_pct'])}</td>"
                 f"<td>{r['gap_pct']:.5f}%</td>"
-                f"<td>{spread_bar(r['net_pct'], 'near')}</td></tr>"
+                f"<td>{spread_bar(r['net_pct'], 'near')}</td>"
+                f"{real_cost_button(r)}</tr>"
             )
         near_section = f"""
         <div class="section-title" style="margin-top:28px">\U0001f7e1 NEAR MISSES ({near_count})</div>
         <table><thead><tr>
           <th>Coin</th><th>Best Pair</th><th>Delta %</th><th>Pi42 %</th><th>CoinSwitch %</th>
-          <th>Gap %</th><th>Net %</th>
+          <th>Gap %</th><th>Net %</th><th>Real Cost</th>
         </tr></thead><tbody>{n_rows}</tbody></table>
         """
     else:
@@ -965,6 +1106,7 @@ def render_indian_opportunities_page():
         profitable_border=profitable_border, best_coin=best_coin, best_net=best_net,
         best_pair=best_pair, near_count=near_count,
         profitable_section=profitable_section, near_section=near_section,
+        real_cost_panel=REAL_COST_PANEL_HTML, real_cost_js=REAL_COST_JS,
     )
 
 
@@ -1018,11 +1160,6 @@ def render_spread_scanner_route():
 
 
 def _validate_test_script_path(module: str):
-    """Basic path-traversal guard: resolves the requested path and
-    confirms it's still inside the project directory and is a .py file.
-    Returns the safe absolute path, or None if the request is invalid.
-    Reasonable for a private single-user tool - not hardened against a
-    malicious multi-user public deployment."""
     if not module or not module.endswith(".py"):
         return None
     candidate = (PROJECT_ROOT / module).resolve()
@@ -1061,9 +1198,6 @@ def render_run_test_route():
             'Invalid path - must be a .py file inside this project.</div>'
         )
     else:
-        # Runs as a SEPARATE subprocess - this app.py process (and every
-        # background thread above: live scanners, alerts, ingestion)
-        # keeps running the whole time, completely unaffected.
         try:
             result = subprocess.run(
                 [sys.executable, str(path)],
@@ -1092,7 +1226,6 @@ def render_run_test_route():
     )
 
 
-# ── ROUTES ────────────────────────────────────────
 @app.route("/")
 def scanner_route():
     return render_scanner_page()

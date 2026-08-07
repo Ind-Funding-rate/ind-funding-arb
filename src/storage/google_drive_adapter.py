@@ -29,14 +29,24 @@ Rate limits: Drive API has a 1000 req/100s quota per user. The daily
 archiver only runs once per day per symbol, so even with hundreds of
 symbols this stays well within limits. Resumable uploads (used for
 files > 5MB) handle network interruptions gracefully.
+
+FIX (2026-08-09): was missing the sys.path.append() line every other
+src-importing script in this project has - "from src.storage.manager
+import StorageAdapter" failed with ModuleNotFoundError: No module named
+'src' the moment this ran anywhere except the exact directory layout
+python happened to already have on its path. Added the same fix used
+throughout the project.
 """
 import os
 import io
 import hashlib
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Optional
+
+sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from src.storage.manager import StorageAdapter
 

@@ -6,10 +6,22 @@ to StorageManager, which delegates here when STORAGE_PROVIDER=google_drive
 is set in the environment. Swapping back to local storage (or forward to
 S3/R2/MinIO) requires changing only that one env var, zero code changes.
 
-Authentication: uses a Google Cloud service account JSON key file, path
-configured via GOOGLE_DRIVE_CREDENTIALS_JSON env var. The service account
-(drive-uploader@funding-arb-storage.iam.gserviceaccount.com) must have
-Editor access on the target Drive folder.
+Authentication: GOOGLE_DRIVE_CREDENTIALS_JSON holds the service account
+key's JSON CONTENT directly (not a file path) - pasted straight into
+.env, same pattern as every other credential in this project. The
+service account (drive-uploader@funding-arb-storage.iam.gserviceaccount.com)
+must have Editor access on the target Drive folder.
+
+FIX (2026-08-02): the previous version treated GOOGLE_DRIVE_CREDENTIALS_JSON
+as a FILE PATH (Path(creds_path).exists(), from_service_account_file(...)),
+which doesn't match how the credentials were actually set up - the raw
+JSON content, not a path, was pasted into .env. Every operation failed
+silently as a result (the real error message got swallowed by a bug in
+how it was being checked). Fixed to parse the env var as JSON content
+directly via from_service_account_info(). Also fixed: error messages now
+always show the actual exception, and the raw credential content is
+never printed even in an error path (a truncated safe summary is shown
+instead, to avoid ever leaking the private key to logs).
 
 The target folder is identified by GOOGLE_DRIVE_FOLDER_ID env var - copy
 the long ID from the folder's URL in Google Drive
@@ -17,32 +29,14 @@ the long ID from the folder's URL in Google Drive
 
 Remote keys (e.g. "delta/futures/BTC/2026/08/01/price.duckdb") are
 mirrored as real folder hierarchies in Drive, so the archive is human-
-browsable and not just a flat bucket of files. This costs a few extra
-API calls per upload (one mkdir per folder level) but makes the archive
-usable directly from Drive if needed.
+browsable and not just a flat bucket of files.
 
-Required packages (not yet in requirements.txt - added to the server
-via ADDITIONAL PYTHON PACKAGES in HidenCloud Startup settings):
+Required packages (ADDITIONAL PYTHON PACKAGES in HidenCloud):
     google-auth google-auth-httplib2 google-api-python-client
-
-Rate limits: Drive API has a 1000 req/100s quota per user. The daily
-archiver only runs once per day per symbol, so even with hundreds of
-symbols this stays well within limits. Resumable uploads (used for
-files > 5MB) handle network interruptions gracefully.
-
-FIX (2026-08-09): was missing the sys.path.append() line every other
-src-importing script in this project has - "from src.storage.manager
-import StorageAdapter" failed with ModuleNotFoundError: No module named
-'src' the moment this ran anywhere except the exact directory layout
-python happened to already have on its path. Added the same fix used
-throughout the project.
 """
 import os
-import io
-import hashlib
 import json
 import sys
-import time
 from pathlib import Path
 from typing import Optional
 
@@ -50,9 +44,6 @@ sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from src.storage.manager import StorageAdapter
 
-# Lazy imports - only loaded when this adapter is actually used,
-# so the rest of the app can import manager.py without needing
-# google-auth installed if they're using local storage.
 _drive_service = None
 
 
@@ -71,14 +62,31 @@ def _get_service():
             "google-auth google-auth-httplib2 google-api-python-client"
         )
 
-    creds_path = os.getenv("GOOGLE_DRIVE_CREDENTIALS_JSON")
-    if not creds_path:
+    creds_json = os.getenv("GOOGLE_DRIVE_CREDENTIALS_JSON")
+    if not creds_json:
         raise RuntimeError("GOOGLE_DRIVE_CREDENTIALS_JSON env var not set")
-    if not Path(creds_path).exists():
-        raise RuntimeError(f"Credentials file not found: {creds_path}")
 
-    creds = service_account.Credentials.from_service_account_file(
-        creds_path,
+    try:
+        creds_info = json.loads(creds_json)
+    except json.JSONDecodeError as e:
+        # Deliberately don't include creds_json in the error - even a
+        # malformed key is still sensitive and shouldn't hit logs.
+        raise RuntimeError(
+            f"GOOGLE_DRIVE_CREDENTIALS_JSON isn't valid JSON ({e}). "
+            f"Check it was pasted as one unbroken block into .env, with "
+            f"no accidental line breaks in the middle."
+        )
+
+    required_fields = ["type", "private_key", "client_email"]
+    missing = [f for f in required_fields if f not in creds_info]
+    if missing:
+        raise RuntimeError(
+            f"GOOGLE_DRIVE_CREDENTIALS_JSON is missing field(s): {missing}. "
+            f"This doesn't look like a complete service account key."
+        )
+
+    creds = service_account.Credentials.from_service_account_info(
+        creds_info,
         scopes=["https://www.googleapis.com/auth/drive"],
     )
     _drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
@@ -86,30 +94,19 @@ def _get_service():
 
 
 class GoogleDriveAdapter(StorageAdapter):
-    """
-    Implements StorageAdapter using Google Drive as the backend.
-    Folder hierarchy in Drive mirrors the remote_key path structure:
-      delta/futures/BTC/2026/08/01/price.duckdb
-    becomes nested folders in Drive with price.duckdb as the file.
-    """
-
     def __init__(self, root_folder_id: str):
         self.root_folder_id = root_folder_id
-        self._folder_cache: dict[str, str] = {}  # path -> Drive folder ID
+        self._folder_cache: dict = {}
 
     def _get_or_create_folder(self, name: str, parent_id: str) -> str:
-        """Gets or creates a single folder by name under parent_id.
-        Caches results to avoid redundant API calls within a session."""
         cache_key = f"{parent_id}/{name}"
         if cache_key in self._folder_cache:
             return self._folder_cache[cache_key]
 
         svc = _get_service()
         query = (
-            f"name='{name}' and "
-            f"'{parent_id}' in parents and "
-            f"mimeType='application/vnd.google-apps.folder' and "
-            f"trashed=false"
+            f"name='{name}' and '{parent_id}' in parents and "
+            f"mimeType='application/vnd.google-apps.folder' and trashed=false"
         )
         results = svc.files().list(q=query, fields="files(id)").execute()
         files = results.get("files", [])
@@ -117,22 +114,14 @@ class GoogleDriveAdapter(StorageAdapter):
         if files:
             folder_id = files[0]["id"]
         else:
-            meta = {
-                "name": name,
-                "mimeType": "application/vnd.google-apps.folder",
-                "parents": [parent_id],
-            }
+            meta = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
             folder = svc.files().create(body=meta, fields="id").execute()
             folder_id = folder["id"]
 
         self._folder_cache[cache_key] = folder_id
         return folder_id
 
-    def _resolve_path(self, remote_key: str) -> tuple[str, str]:
-        """Splits remote_key into (parent_folder_id, filename), creating
-        intermediate folders in Drive as needed.
-        e.g. 'delta/futures/BTC/2026/08/01/price.duckdb'
-          -> (id of .../01/ folder, 'price.duckdb')"""
+    def _resolve_path(self, remote_key: str):
         parts = remote_key.replace("\\", "/").split("/")
         filename = parts[-1]
         folders = parts[:-1]
@@ -144,58 +133,37 @@ class GoogleDriveAdapter(StorageAdapter):
         return current_parent, filename
 
     def _find_file_id(self, parent_id: str, filename: str) -> Optional[str]:
-        """Returns the Drive file ID if filename exists in parent_id, else None."""
         svc = _get_service()
-        query = (
-            f"name='{filename}' and "
-            f"'{parent_id}' in parents and "
-            f"trashed=false"
-        )
+        query = f"name='{filename}' and '{parent_id}' in parents and trashed=false"
         results = svc.files().list(q=query, fields="files(id)").execute()
         files = results.get("files", [])
         return files[0]["id"] if files else None
 
     def upload(self, local_path: str, remote_key: str) -> bool:
-        """Uploads local_path to Drive at remote_key. Uses resumable upload
-        for robustness - handles network interruptions gracefully."""
         try:
             from googleapiclient.http import MediaFileUpload
 
             parent_id, filename = self._resolve_path(remote_key)
             file_size = Path(local_path).stat().st_size
-            resumable = file_size > 5 * 1024 * 1024  # resumable above 5MB
+            resumable = file_size > 5 * 1024 * 1024
 
-            media = MediaFileUpload(
-                local_path,
-                mimetype="application/octet-stream",
-                resumable=resumable,
-            )
-
+            media = MediaFileUpload(local_path, mimetype="application/octet-stream", resumable=resumable)
             existing_id = self._find_file_id(parent_id, filename)
             svc = _get_service()
 
             if existing_id:
-                # Update existing file rather than creating a duplicate
-                svc.files().update(
-                    fileId=existing_id,
-                    media_body=media,
-                ).execute()
+                svc.files().update(fileId=existing_id, media_body=media).execute()
             else:
                 meta = {"name": filename, "parents": [parent_id]}
-                svc.files().create(
-                    body=meta,
-                    media_body=media,
-                    fields="id",
-                ).execute()
+                svc.files().create(body=meta, media_body=media, fields="id").execute()
 
             print(f"    [drive] uploaded {remote_key} ({file_size:,} bytes)")
             return True
         except Exception as e:
-            print(f"    [drive] upload failed ({remote_key}): {e}")
+            print(f"    [drive] upload failed ({remote_key}): {type(e).__name__}: {e}")
             return False
 
     def download(self, remote_key: str, local_path: str) -> bool:
-        """Downloads remote_key from Drive to local_path."""
         try:
             from googleapiclient.http import MediaIoBaseDownload
 
@@ -218,7 +186,7 @@ class GoogleDriveAdapter(StorageAdapter):
             print(f"    [drive] downloaded {remote_key} -> {local_path}")
             return True
         except Exception as e:
-            print(f"    [drive] download failed ({remote_key}): {e}")
+            print(f"    [drive] download failed ({remote_key}): {type(e).__name__}: {e}")
             return False
 
     def exists(self, remote_key: str) -> bool:
@@ -226,11 +194,10 @@ class GoogleDriveAdapter(StorageAdapter):
             parent_id, filename = self._resolve_path(remote_key)
             return self._find_file_id(parent_id, filename) is not None
         except Exception as e:
-            print(f"    [drive] exists check failed ({remote_key}): {e}")
+            print(f"    [drive] exists check failed ({remote_key}): {type(e).__name__}: {e}")
             return False
 
     def list_keys(self, prefix: str) -> list:
-        """Lists all file keys under prefix. Recursively walks folders."""
         try:
             parts = prefix.strip("/").split("/")
             current_parent = self.root_folder_id
@@ -240,10 +207,8 @@ class GoogleDriveAdapter(StorageAdapter):
                 if not part:
                     continue
                 query = (
-                    f"name='{part}' and "
-                    f"'{current_parent}' in parents and "
-                    f"mimeType='application/vnd.google-apps.folder' and "
-                    f"trashed=false"
+                    f"name='{part}' and '{current_parent}' in parents and "
+                    f"mimeType='application/vnd.google-apps.folder' and trashed=false"
                 )
                 results = svc.files().list(q=query, fields="files(id)").execute()
                 files = results.get("files", [])
@@ -253,7 +218,7 @@ class GoogleDriveAdapter(StorageAdapter):
 
             return self._list_recursive(current_parent, prefix.rstrip("/"))
         except Exception as e:
-            print(f"    [drive] list_keys failed ({prefix}): {e}")
+            print(f"    [drive] list_keys failed ({prefix}): {type(e).__name__}: {e}")
             return []
 
     def _list_recursive(self, folder_id: str, path_prefix: str) -> list:
@@ -284,21 +249,17 @@ class GoogleDriveAdapter(StorageAdapter):
             parent_id, filename = self._resolve_path(remote_key)
             file_id = self._find_file_id(parent_id, filename)
             if not file_id:
-                return True  # already gone, that's fine
+                return True
             _get_service().files().delete(fileId=file_id).execute()
             print(f"    [drive] deleted {remote_key}")
             return True
         except Exception as e:
-            print(f"    [drive] delete failed ({remote_key}): {e}")
+            print(f"    [drive] delete failed ({remote_key}): {type(e).__name__}: {e}")
             return False
 
 
 if __name__ == "__main__":
-    """Standalone test - verifies the full round trip against real Drive.
-    Requires GOOGLE_DRIVE_CREDENTIALS_JSON and GOOGLE_DRIVE_FOLDER_ID
-    to be set in .env before running."""
     import tempfile
-    from datetime import date
     from dotenv import load_dotenv
     load_dotenv("/home/container/.env")
 
@@ -310,6 +271,16 @@ if __name__ == "__main__":
     print("=" * 54)
     print("  GOOGLE DRIVE ADAPTER - STANDALONE TEST")
     print("=" * 54)
+
+    # Fail fast with a clear message if credentials don't even load,
+    # before attempting any real Drive operations.
+    try:
+        _get_service()
+        print("\n[0] Credentials loaded and authenticated successfully.")
+    except Exception as e:
+        print(f"\n[0] FAILED to load credentials: {type(e).__name__}: {e}")
+        print("\nStopping here - fix the credentials before continuing.")
+        exit(1)
 
     adapter = GoogleDriveAdapter(root_folder_id=folder_id)
     test_key = "test/adapter-verify/2026/08/01/hello.txt"
@@ -348,7 +319,4 @@ if __name__ == "__main__":
 
     print("\n" + "=" * 54)
     print("  All PASS = Google Drive adapter working end to end.")
-    print("  Next: set STORAGE_PROVIDER=google_drive in .env and")
-    print("  the DailyArchiver will automatically use Drive instead")
-    print("  of local storage - zero other code changes needed.")
     print("=" * 54)

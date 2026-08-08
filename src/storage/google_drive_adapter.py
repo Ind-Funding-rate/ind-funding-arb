@@ -12,21 +12,25 @@ Authentication: GOOGLE_DRIVE_CREDENTIALS_JSON can be EITHER:
         this project, then point this at its path), OR
     (b) the raw JSON content itself, pasted directly into .env
 
-FIX (2026-08-08): manually retyping/pasting the JSON content into .env
-kept breaking - the key's private_key field contains escaped `\\n`
-sequences that some apps silently convert into real line breaks when
-copy-pasted, corrupting the JSON (this is what caused "Expecting value:
-line 1 column 1" - the value wasn't valid JSON at all). Rather than
-fight that fragile manual-paste process again, this now supports
-reading directly from an uploaded file - upload works reliably every
-time (used successfully all night for every other file in the project),
-so this sidesteps the fragile-paste problem entirely. Content-based
-.env values are still supported too, for consistency with how every
-other credential in this project works, if you'd rather use that.
-
 The target folder is identified by GOOGLE_DRIVE_FOLDER_ID env var - copy
 the long ID from the folder's URL in Google Drive
 (https://drive.google.com/drive/folders/<THIS_PART>).
+
+FIX (2026-08-09): googleapiclient's HttpError has a known quirk - str(e)
+can come back completely empty depending on the installed version, even
+though the error is real and has useful detail (HTTP status code,
+reason, and often a JSON body explaining exactly what's wrong). Every
+except block below now specifically checks for HttpError and pulls
+status/reason/content directly from its known attributes instead of
+relying on str(e), which is what was producing "HttpError: " with
+nothing useful after it. Also fixed the standalone test's summary,
+which was unconditionally printing "All PASS" regardless of what
+actually happened - it now tracks real results and only claims success
+if every step actually passed. Added an isolated auth-only check
+(Drive `about.get`) as test step [0b], since "credentials load fine but
+every real operation fails identically" is the classic symptom of the
+Drive API not being ENABLED for the Google Cloud project (a separate
+step from creating credentials) - this narrows straight to that.
 """
 import os
 import json
@@ -41,6 +45,27 @@ from src.storage.manager import StorageAdapter
 _drive_service = None
 
 
+def _http_error_detail(e) -> str:
+    """googleapiclient.errors.HttpError's str() can be empty even when
+    there's real, useful detail sitting on the exception's own
+    attributes - this pulls it out directly instead of trusting str()."""
+    try:
+        from googleapiclient.errors import HttpError
+    except ImportError:
+        return str(e)
+
+    if isinstance(e, HttpError):
+        status = getattr(e.resp, "status", "?")
+        reason = getattr(e.resp, "reason", "")
+        content = ""
+        try:
+            content = e.content.decode("utf-8") if isinstance(e.content, bytes) else str(e.content)
+        except Exception:
+            pass
+        return f"HTTP {status} {reason} - {content}".strip(" -")
+    return f"{type(e).__name__}: {e}"
+
+
 def _load_credentials_info() -> dict:
     """Reads GOOGLE_DRIVE_CREDENTIALS_JSON and figures out whether it's
     a file path or raw JSON content, then returns the parsed dict either
@@ -52,7 +77,6 @@ def _load_credentials_info() -> dict:
 
     raw = raw.strip()
 
-    # Looks like a file path (not starting with '{') - try reading it.
     if not raw.startswith("{"):
         path = Path(raw)
         if not path.exists():
@@ -68,7 +92,6 @@ def _load_credentials_info() -> dict:
         except json.JSONDecodeError as e:
             raise RuntimeError(f"File at '{raw}' isn't valid JSON: {e}")
 
-    # Starts with '{' - treat as raw JSON content pasted into .env.
     try:
         return json.loads(raw)
     except json.JSONDecodeError as e:
@@ -182,7 +205,7 @@ class GoogleDriveAdapter(StorageAdapter):
             print(f"    [drive] uploaded {remote_key} ({file_size:,} bytes)")
             return True
         except Exception as e:
-            print(f"    [drive] upload failed ({remote_key}): {type(e).__name__}: {e}")
+            print(f"    [drive] upload failed ({remote_key}): {_http_error_detail(e)}")
             return False
 
     def download(self, remote_key: str, local_path: str) -> bool:
@@ -208,7 +231,7 @@ class GoogleDriveAdapter(StorageAdapter):
             print(f"    [drive] downloaded {remote_key} -> {local_path}")
             return True
         except Exception as e:
-            print(f"    [drive] download failed ({remote_key}): {type(e).__name__}: {e}")
+            print(f"    [drive] download failed ({remote_key}): {_http_error_detail(e)}")
             return False
 
     def exists(self, remote_key: str) -> bool:
@@ -216,7 +239,7 @@ class GoogleDriveAdapter(StorageAdapter):
             parent_id, filename = self._resolve_path(remote_key)
             return self._find_file_id(parent_id, filename) is not None
         except Exception as e:
-            print(f"    [drive] exists check failed ({remote_key}): {type(e).__name__}: {e}")
+            print(f"    [drive] exists check failed ({remote_key}): {_http_error_detail(e)}")
             return False
 
     def list_keys(self, prefix: str) -> list:
@@ -240,7 +263,7 @@ class GoogleDriveAdapter(StorageAdapter):
 
             return self._list_recursive(current_parent, prefix.rstrip("/"))
         except Exception as e:
-            print(f"    [drive] list_keys failed ({prefix}): {type(e).__name__}: {e}")
+            print(f"    [drive] list_keys failed ({prefix}): {_http_error_detail(e)}")
             return []
 
     def _list_recursive(self, folder_id: str, path_prefix: str) -> list:
@@ -276,7 +299,7 @@ class GoogleDriveAdapter(StorageAdapter):
             print(f"    [drive] deleted {remote_key}")
             return True
         except Exception as e:
-            print(f"    [drive] delete failed ({remote_key}): {type(e).__name__}: {e}")
+            print(f"    [drive] delete failed ({remote_key}): {_http_error_detail(e)}")
             return False
 
 
@@ -295,27 +318,45 @@ if __name__ == "__main__":
     print("=" * 54)
 
     try:
-        _get_service()
+        svc = _get_service()
         print("\n[0] Credentials loaded and authenticated successfully.")
     except Exception as e:
-        print(f"\n[0] FAILED to load credentials: {type(e).__name__}: {e}")
+        print(f"\n[0] FAILED to load credentials: {_http_error_detail(e)}")
         print("\nStopping here - fix the credentials before continuing.")
+        exit(1)
+
+    print("\n[0b] Testing a minimal, credentials-only Drive API call...")
+    try:
+        about = svc.about().get(fields="user").execute()
+        print(f"     PASS - Drive API responded. Authenticated as: "
+              f"{about.get('user', {}).get('emailAddress')}")
+    except Exception as e:
+        print(f"     FAIL: {_http_error_detail(e)}")
+        print("\n     If this failed but [0] passed, the most common cause is:")
+        print("     the Google Drive API isn't ENABLED for this project yet -")
+        print("     having valid credentials is a separate step from turning")
+        print("     the API itself on. Fix: console.cloud.google.com ->")
+        print("     APIs & Services -> Enable APIs -> search 'Google Drive")
+        print("     API' -> Enable. Then re-run this test - no restart needed,")
+        print("     nothing on the server changes, only Google's side does.")
+        print("\n" + "=" * 54)
         exit(1)
 
     adapter = GoogleDriveAdapter(root_folder_id=folder_id)
     test_key = "test/adapter-verify/2026/08/01/hello.txt"
+    results = {}
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         f.write("Google Drive adapter test - if you see this in Drive, it works.")
         test_file = f.name
 
     print(f"\n[1] Uploading test file to Drive at key: {test_key}...")
-    ok = adapter.upload(test_file, test_key)
-    print(f"    {'PASS' if ok else 'FAIL'}")
+    results["upload"] = adapter.upload(test_file, test_key)
+    print(f"    {'PASS' if results['upload'] else 'FAIL'}")
 
     print(f"\n[2] Checking it exists in Drive...")
-    exists = adapter.exists(test_key)
-    print(f"    {'PASS' if exists else 'FAIL'}")
+    results["exists"] = adapter.exists(test_key)
+    print(f"    {'PASS' if results['exists'] else 'FAIL'}")
 
     print(f"\n[3] Downloading it back...")
     fetch_path = "/tmp/drive_test_fetch.txt"
@@ -323,20 +364,33 @@ if __name__ == "__main__":
     if fetched:
         content = open(fetch_path).read()
         original = open(test_file).read()
-        print(f"    {'PASS - contents match' if content == original else 'FAIL - contents differ'}")
+        results["download"] = content == original
+        print(f"    {'PASS - contents match' if results['download'] else 'FAIL - contents differ'}")
     else:
+        results["download"] = False
         print("    FAIL")
 
     print(f"\n[4] Listing keys under 'test/'...")
     keys = adapter.list_keys("test")
+    results["list"] = test_key in keys
     print(f"    Found: {keys}")
+    print(f"    {'PASS' if results['list'] else 'FAIL - our test file not in the list'}")
 
     print(f"\n[5] Deleting the test file...")
     deleted = adapter.delete(test_key)
-    print(f"    {'PASS' if deleted else 'FAIL'}")
     still_exists = adapter.exists(test_key)
+    results["delete"] = deleted and not still_exists
+    print(f"    {'PASS' if results['delete'] else 'FAIL'}")
     print(f"    Confirmed gone: {'PASS' if not still_exists else 'FAIL'}")
 
     print("\n" + "=" * 54)
-    print("  All PASS = Google Drive adapter working end to end.")
+    if all(results.values()):
+        print("  ALL PASS - Google Drive adapter working end to end.")
+        print("  Next: set STORAGE_PROVIDER=google_drive in .env and")
+        print("  the DailyArchiver will automatically use Drive instead")
+        print("  of local storage - zero other code changes needed.")
+    else:
+        failed = [k for k, v in results.items() if not v]
+        print(f"  NOT all passed - failed step(s): {failed}")
+        print("  See the [!] messages above for the real HTTP error detail.")
     print("=" * 54)

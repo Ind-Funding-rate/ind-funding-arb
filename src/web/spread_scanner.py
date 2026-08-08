@@ -31,9 +31,28 @@ above only ever shows the RAW price gap - no fees, no slippage. Clicking
 Real Cost calls out to src/data/orderbook_depth.py, which fetches LIVE
 order book depth for that one coin/pair on demand and walks it for the
 actual fill price on all 4 legs of a real round trip (open + close),
-plus confirmed real fees. This is deliberately NOT done for all 300+
-coins on every refresh - full depth fetching is much heavier than the
-last-price scan, so it only runs for the one row you click.
+plus confirmed real fees.
+
+2026-08-02 feature: added an inline "Net (real)" column, showing the
+same real-cost net% directly in the table for every row currently
+visible (respects the "Show top" limit - never all 300+ coins, only
+whatever's on screen), computed via compute_real_cost_batch() (thread
+pool, concurrent per coin) so it doesn't take N times as long for N
+rows. The "Real Cost" button is kept unchanged for the full leg-by-leg
+breakdown when you want to dig into one coin specifically.
+
+EXPLICIT TRADEOFF (requested, not a default): this inline column
+refreshes on the SAME 4-second cadence as the price scan, which is
+significantly heavier on Delta/Pi42/CoinSwitch than the price-only scan
+alone - order book depth (+ a CoinSwitch fee lookup) is fetched for
+every visible row, every 4 seconds, for as long as this page stays
+open. A basic overlap guard (realCostBatchInFlight) skips a refresh
+tick if the previous batch hasn't finished yet, so slow responses don't
+compound into a growing pile of parallel requests - but the underlying
+load itself was a deliberate choice, not something this guards against.
+If this ever needs to be dialed back, REFRESH_INTERVAL_SECONDS controls
+the price scan and the JS setInterval(refreshData, 4000) call controls
+this - they are intentionally decoupled from each other.
 """
 import asyncio
 import itertools
@@ -282,6 +301,7 @@ SPREAD_SCANNER_CSS = """
   .rc-leg { display:flex; justify-content:space-between; padding:4px 0;
     border-bottom:1px dashed #2a2d38; font-size:13px; }
   .rc-leg span:first-child { color:#8b8fa3; }
+  .rc-inline-pending { color:#6b7385; font-size:12px; }
 """
 
 SPREAD_SCANNER_JS = r"""
@@ -289,6 +309,7 @@ SPREAD_SCANNER_JS = r"""
 const EXCHANGE_LABELS = {"delta": "Delta Exchange", "pi42": "Pi42", "coinswitch": "CoinSwitch"};
 let autoRefreshTimer = null;
 let lastCoin = null, lastCheap = null, lastExpensive = null;
+let realCostBatchInFlight = false;
 
 function buildQuery() {
   const checks = document.querySelectorAll('.exchange-checks input:checked');
@@ -300,18 +321,23 @@ function buildQuery() {
   return exchangeParams + '&search=' + encodeURIComponent(search) + '&min_spread=' + minSpread + '&limit=' + limit;
 }
 
+function rowDirection(r) {
+  const cheapEx = r.spread_pct >= 0 ? r.exchange_a : r.exchange_b;
+  const expEx = r.spread_pct >= 0 ? r.exchange_b : r.exchange_a;
+  return {cheapEx: cheapEx, expEx: expEx};
+}
+
 function renderRows(rows) {
   const tbody = document.querySelector('#spread-tbl tbody');
   if (rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#8b8fa3">No data yet - either still warming up, fewer than 2 exchanges selected, or nothing matches the filter.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#8b8fa3">No data yet - either still warming up, fewer than 2 exchanges selected, or nothing matches the filter.</td></tr>';
     return;
   }
   tbody.innerHTML = rows.map(function(r) {
     const sign = r.diff >= 0 ? '+' : '';
     const pctSign = r.spread_pct >= 0 ? '+' : '';
     const pairLabel = (EXCHANGE_LABELS[r.exchange_a] || r.exchange_a) + ' vs ' + (EXCHANGE_LABELS[r.exchange_b] || r.exchange_b);
-    const cheapEx = r.spread_pct >= 0 ? r.exchange_a : r.exchange_b;
-    const expEx = r.spread_pct >= 0 ? r.exchange_b : r.exchange_a;
+    const dir = rowDirection(r);
     return '<tr>' +
       '<td><b>' + r.coin + '</b></td>' +
       '<td class="pair-tag">' + pairLabel + '</td>' +
@@ -320,9 +346,48 @@ function renderRows(rows) {
       '<td>' + sign + '$' + r.diff.toLocaleString(undefined, {maximumFractionDigits: 8}) + '</td>' +
       '<td class="status-' + r.status + '">' + pctSign + r.spread_pct.toFixed(3) + '%</td>' +
       '<td>' + r.last_updated + '</td>' +
-      '<td><button class="detail-btn" onclick="calculateRealCost(\'' + r.coin + '\',\'' + cheapEx + '\',\'' + expEx + '\')">Real Cost</button></td>' +
+      '<td id="rc-inline-' + r.coin + '" class="rc-inline-pending">calculating\u2026</td>' +
+      '<td><button class="detail-btn" onclick="calculateRealCost(\'' + r.coin + '\',\'' + dir.cheapEx + '\',\'' + dir.expEx + '\')">Real Cost</button></td>' +
     '</tr>';
   }).join('');
+}
+
+function refreshInlineRealCosts(rows) {
+  if (realCostBatchInFlight) return;
+  if (!rows || rows.length === 0) return;
+  realCostBatchInFlight = true;
+
+  const items = rows.map(function(r) {
+    const dir = rowDirection(r);
+    return {coin: r.coin, exchange_cheap: dir.cheapEx, exchange_expensive: dir.expEx};
+  });
+  const positionInput = document.getElementById('rc-position');
+  const position = positionInput ? (positionInput.value || 1000) : 1000;
+
+  fetch('/spread-scanner/real-cost-batch', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({items: items, position: position}),
+  })
+    .then(function(res) { return res.json(); })
+    .then(function(data) {
+      const results = data.results || {};
+      for (const coin in results) {
+        const cell = document.getElementById('rc-inline-' + coin);
+        if (!cell) continue;
+        const result = results[coin];
+        if (result.error) {
+          cell.className = 'rc-inline-pending';
+          cell.innerText = 'n/a';
+        } else {
+          const cls = result.net_pct > 0 ? 'status-positive' : 'status-negative';
+          cell.className = cls;
+          cell.innerText = (result.net_pct >= 0 ? '+' : '') + result.net_pct.toFixed(3) + '%';
+        }
+      }
+    })
+    .catch(function() { /* leave cells as "calculating..." until next tick */ })
+    .finally(function() { realCostBatchInFlight = false; });
 }
 
 function updateBanner(status, error, ageSeconds) {
@@ -343,7 +408,7 @@ function refreshData() {
   const checks = document.querySelectorAll('.exchange-checks input:checked');
   if (checks.length < 2) {
     document.querySelector('#spread-tbl tbody').innerHTML =
-      '<tr><td colspan="8" style="text-align:center;color:#facc15">Select at least 2 exchanges to compare.</td></tr>';
+      '<tr><td colspan="9" style="text-align:center;color:#facc15">Select at least 2 exchanges to compare.</td></tr>';
     return;
   }
   fetch('/spread-scanner/data?' + buildQuery())
@@ -351,6 +416,7 @@ function refreshData() {
     .then(function(data) {
       renderRows(data.rows);
       updateBanner(data.cache_status, data.cache_error, data.cache_age_seconds);
+      refreshInlineRealCosts(data.rows);
     });
 }
 
@@ -432,7 +498,7 @@ SPREAD_SCANNER_PAGE = """
 <h2 style="font-size:18px;margin:0 0 6px;">Spread Arbitrage Scanner</h2>
 <p class="meta">Live price spread between exchanges for the same coin. Independent of the funding-rate scanner \u2014 no signals, no backtesting, no trade execution.</p>
 <div id="status-banner" class="{banner_class}">{banner_text}</div>
-<p class="fx-note">All prices are each exchange's own native USD/USDT market \u2014 Delta USD, Pi42's USDT market (not INR), CoinSwitch USDT. No currency conversion involved. The table below shows raw price gap only \u2014 click \u201cReal Cost\u201d on any row for actual fees + live order-book slippage.</p>
+<p class="fx-note">All prices are each exchange's own native USD/USDT market \u2014 Delta USD, Pi42's USDT market (not INR), CoinSwitch USDT. No currency conversion involved. \u201cNet (real)\u201d recalculates every 4s using live order-book depth for every visible row \u2014 click \u201cReal Cost\u201d on a row for the full fee + slippage breakdown.</p>
 
 <div class="spread-controls">
   <div><label>Exchanges to compare (pick 2 or all 3)</label>
@@ -454,7 +520,7 @@ SPREAD_SCANNER_PAGE = """
 <table id="spread-tbl">
 <thead><tr>
   <th>Coin</th><th>Best Pair</th><th>Price A (USD)</th><th>Price B (USD)</th>
-  <th>Price Diff</th><th>Spread %</th><th>Last Updated</th><th>Real Cost</th>
+  <th>Price Diff</th><th>Spread %</th><th>Last Updated</th><th>Net (real)</th><th>Real Cost</th>
 </tr></thead>
 <tbody>{rows}</tbody>
 </table>
@@ -478,7 +544,7 @@ SPREAD_SCANNER_PAGE = """
 
 def _render_rows_html(rows):
     if not rows:
-        return '<tr><td colspan="8" style="text-align:center;color:#8b8fa3">No data yet - either still warming up, fewer than 2 exchanges selected, or nothing matches the filter.</td></tr>'
+        return '<tr><td colspan="9" style="text-align:center;color:#8b8fa3">No data yet - either still warming up, fewer than 2 exchanges selected, or nothing matches the filter.</td></tr>'
     html = ""
     for r in rows:
         pair_label = f"{EXCHANGE_LABELS[r['exchange_a']]} vs {EXCHANGE_LABELS[r['exchange_b']]}"
@@ -493,6 +559,7 @@ def _render_rows_html(rows):
             f"<td>{r['diff']:+,.8f}</td>"
             f"<td class='status-{r['status']}'>{r['spread_pct']:+.3f}%</td>"
             f"<td>{r['last_updated']}</td>"
+            f"<td id='rc-inline-{r['coin']}' class='rc-inline-pending'>calculating\u2026</td>"
             f"<td><button class='detail-btn' onclick=\"calculateRealCost('{r['coin']}','{cheap_ex}','{exp_ex}')\">Real Cost</button></td>"
             f"</tr>"
         )

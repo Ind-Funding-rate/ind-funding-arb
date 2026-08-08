@@ -9,9 +9,13 @@ endpoints confirmed working via src/data/test_depth_and_fees.py on
 
 This is intentionally NOT part of the fast 300-coin price scan in
 spread_scanner.py - fetching full depth is much heavier than fetching
-last price, so this is built to be called on-demand for ONE coin + ONE
-exchange pair at a time (when a user clicks "Real Cost" on a specific
-row), not run in a background loop across the whole coin universe.
+last price. compute_real_cost() is for a SINGLE coin+pair (used by the
+"Real Cost" button's detail panel). compute_real_cost_batch() (added
+2026-08-02) computes MULTIPLE coins concurrently via a thread pool - used
+by the Spread Scanner's inline "Net (real)" column, which recalculates
+for all visible rows on the same 4s cadence as the price scan (a
+deliberate, heavier choice - see spread_scanner.py for the tradeoff
+note). A failure on one coin in a batch does not block the others.
 
 Confirmed real taker fee rates (before GST):
 - Delta:      0.05%   (GST applies: +18% -> 0.0590% effective per fill)
@@ -29,6 +33,7 @@ A full spread-arbitrage round trip is 4 fills, not 2:
 Each fill gets its own live-depth slippage calculation and its own fee.
 """
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.data.coinswitch_client import _sign_request, BASE_URL as CS_BASE_URL
 
@@ -36,6 +41,8 @@ GST_MULTIPLIER = 1.18
 
 DELTA_TAKER_FEE = 0.0005   # 0.05%, confirmed earlier in this project
 PI42_TAKER_FEE = 0.0008    # 0.08%, confirmed earlier in this project
+
+BATCH_MAX_WORKERS = 8
 
 
 def get_delta_orderbook(coin):
@@ -196,3 +203,39 @@ def compute_real_cost(coin, exchange_cheap, exchange_expensive, position_usd):
         "net_pct": net_pct,
         "fully_fillable_at_size": fully_fillable,
     }
+
+
+def compute_real_cost_batch(items, position_usd, max_workers=BATCH_MAX_WORKERS):
+    """
+    items: list of dicts {"coin": ..., "exchange_cheap": ..., "exchange_expensive": ...}
+    Computes compute_real_cost() for every item CONCURRENTLY via a thread
+    pool, so a batch of N coins takes roughly as long as the single
+    slowest one, not N times as long. Used by the Spread Scanner's inline
+    "Net (real)" column, which - by explicit choice, despite the extra
+    exchange load - refreshes on the same 4s cadence as the price scan.
+
+    A failure fetching depth for one coin does not block or fail the
+    others - that coin's entry in the returned dict is {"error": "..."}
+    instead, everything else still returns normally.
+
+    Returns: {coin: result_dict, ...} - same result_dict shape as
+    compute_real_cost() returns for a single coin.
+    """
+    results = {}
+    if not items:
+        return results
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_coin = {
+            executor.submit(
+                compute_real_cost, item["coin"], item["exchange_cheap"],
+                item["exchange_expensive"], position_usd,
+            ): item["coin"]
+            for item in items
+        }
+        for future in as_completed(future_to_coin):
+            coin = future_to_coin[future]
+            try:
+                results[coin] = future.result()
+            except Exception as e:
+                results[coin] = {"error": str(e)}
+    return results

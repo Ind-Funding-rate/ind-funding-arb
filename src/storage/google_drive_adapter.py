@@ -26,11 +26,18 @@ relying on str(e), which is what was producing "HttpError: " with
 nothing useful after it. Also fixed the standalone test's summary,
 which was unconditionally printing "All PASS" regardless of what
 actually happened - it now tracks real results and only claims success
-if every step actually passed. Added an isolated auth-only check
-(Drive `about.get`) as test step [0b], since "credentials load fine but
-every real operation fails identically" is the classic symptom of the
-Drive API not being ENABLED for the Google Cloud project (a separate
-step from creating credentials) - this narrows straight to that.
+if every step actually passed.
+
+FIX (2026-08-09, second pass): every real operation was failing with
+"File not found: ." - Drive's API deliberately returns 404 (not 403)
+both when an ID is genuinely wrong AND when the ID is right but the
+service account lacks access, so this alone doesn't tell you which.
+Added test step [0c]: directly calls files().get() on the EXACT
+configured GOOGLE_DRIVE_FOLDER_ID and prints either the real folder
+name (proving both the ID and the sharing permission are correct) or
+the precise error - and prints the raw folder_id value with repr() so
+invisible whitespace/newline characters from a copy-paste are visible
+instead of hidden.
 """
 import os
 import json
@@ -316,6 +323,8 @@ if __name__ == "__main__":
     print("=" * 54)
     print("  GOOGLE DRIVE ADAPTER - STANDALONE TEST")
     print("=" * 54)
+    print(f"\n  Configured GOOGLE_DRIVE_FOLDER_ID = {folder_id!r}")
+    print(f"  (repr() shown deliberately - reveals hidden whitespace/newlines)")
 
     try:
         svc = _get_service()
@@ -328,17 +337,37 @@ if __name__ == "__main__":
     print("\n[0b] Testing a minimal, credentials-only Drive API call...")
     try:
         about = svc.about().get(fields="user").execute()
-        print(f"     PASS - Drive API responded. Authenticated as: "
-              f"{about.get('user', {}).get('emailAddress')}")
+        sa_email = about.get('user', {}).get('emailAddress')
+        print(f"     PASS - Drive API responded. Authenticated as: {sa_email}")
     except Exception as e:
         print(f"     FAIL: {_http_error_detail(e)}")
-        print("\n     If this failed but [0] passed, the most common cause is:")
-        print("     the Google Drive API isn't ENABLED for this project yet -")
-        print("     having valid credentials is a separate step from turning")
-        print("     the API itself on. Fix: console.cloud.google.com ->")
-        print("     APIs & Services -> Enable APIs -> search 'Google Drive")
-        print("     API' -> Enable. Then re-run this test - no restart needed,")
-        print("     nothing on the server changes, only Google's side does.")
+        print("\n     If this failed, the Google Drive API likely isn't ENABLED")
+        print("     for this project - console.cloud.google.com -> APIs &")
+        print("     Services -> Enable APIs -> search 'Google Drive API' -> Enable.")
+        print("\n" + "=" * 54)
+        exit(1)
+
+    print(f"\n[0c] Checking direct access to the configured folder ({folder_id!r})...")
+    try:
+        folder_meta = svc.files().get(
+            fileId=folder_id, fields="id,name,mimeType,owners"
+        ).execute()
+        print(f"     PASS - folder found: '{folder_meta.get('name')}' "
+              f"(id={folder_meta.get('id')})")
+        if folder_meta.get("mimeType") != "application/vnd.google-apps.folder":
+            print(f"     WARNING - this ID points to something that is NOT a "
+                  f"folder (mimeType={folder_meta.get('mimeType')})")
+    except Exception as e:
+        print(f"     FAIL: {_http_error_detail(e)}")
+        print(f"\n     This means either:")
+        print(f"     (a) The folder ID is wrong/mistyped (double-check against")
+        print(f"         the Drive URL, and check the repr() output above for")
+        print(f"         any stray spaces or newline characters), OR")
+        print(f"     (b) The folder exists but was NOT actually shared with")
+        print(f"         '{sa_email}' as Editor. Go to the folder in Drive,")
+        print(f"         right-click -> Share, and confirm that exact email")
+        print(f"         is listed there with Editor access - re-share it if")
+        print(f"         it's missing, even if you thought you already did this.")
         print("\n" + "=" * 54)
         exit(1)
 

@@ -3,36 +3,30 @@ Google Drive Storage Adapter - implements StorageAdapter from manager.py.
 
 The rest of the application NEVER imports this directly - it only talks
 to StorageManager, which delegates here when STORAGE_PROVIDER=google_drive
-is set in the environment. Swapping back to local storage (or forward to
-S3/R2/MinIO) requires changing only that one env var, zero code changes.
+is set in the environment.
 
-Authentication: GOOGLE_DRIVE_CREDENTIALS_JSON holds the service account
-key's JSON CONTENT directly (not a file path) - pasted straight into
-.env, same pattern as every other credential in this project. The
-service account (drive-uploader@funding-arb-storage.iam.gserviceaccount.com)
-must have Editor access on the target Drive folder.
+Authentication: GOOGLE_DRIVE_CREDENTIALS_JSON can be EITHER:
+    (a) a real file path to the downloaded service-account .json key
+        (recommended - upload the actual file via HidenCloud's File
+        Manager, same reliable method used for every other file in
+        this project, then point this at its path), OR
+    (b) the raw JSON content itself, pasted directly into .env
 
-FIX (2026-08-02): the previous version treated GOOGLE_DRIVE_CREDENTIALS_JSON
-as a FILE PATH (Path(creds_path).exists(), from_service_account_file(...)),
-which doesn't match how the credentials were actually set up - the raw
-JSON content, not a path, was pasted into .env. Every operation failed
-silently as a result (the real error message got swallowed by a bug in
-how it was being checked). Fixed to parse the env var as JSON content
-directly via from_service_account_info(). Also fixed: error messages now
-always show the actual exception, and the raw credential content is
-never printed even in an error path (a truncated safe summary is shown
-instead, to avoid ever leaking the private key to logs).
+FIX (2026-08-08): manually retyping/pasting the JSON content into .env
+kept breaking - the key's private_key field contains escaped `\\n`
+sequences that some apps silently convert into real line breaks when
+copy-pasted, corrupting the JSON (this is what caused "Expecting value:
+line 1 column 1" - the value wasn't valid JSON at all). Rather than
+fight that fragile manual-paste process again, this now supports
+reading directly from an uploaded file - upload works reliably every
+time (used successfully all night for every other file in the project),
+so this sidesteps the fragile-paste problem entirely. Content-based
+.env values are still supported too, for consistency with how every
+other credential in this project works, if you'd rather use that.
 
 The target folder is identified by GOOGLE_DRIVE_FOLDER_ID env var - copy
 the long ID from the folder's URL in Google Drive
 (https://drive.google.com/drive/folders/<THIS_PART>).
-
-Remote keys (e.g. "delta/futures/BTC/2026/08/01/price.duckdb") are
-mirrored as real folder hierarchies in Drive, so the archive is human-
-browsable and not just a flat bucket of files.
-
-Required packages (ADDITIONAL PYTHON PACKAGES in HidenCloud):
-    google-auth google-auth-httplib2 google-api-python-client
 """
 import os
 import json
@@ -45,6 +39,47 @@ sys.path.append(str(Path(__file__).resolve().parents[2]))
 from src.storage.manager import StorageAdapter
 
 _drive_service = None
+
+
+def _load_credentials_info() -> dict:
+    """Reads GOOGLE_DRIVE_CREDENTIALS_JSON and figures out whether it's
+    a file path or raw JSON content, then returns the parsed dict either
+    way. Tries file-path first (the recommended, reliable route) since a
+    value ending in .json that exists on disk is unambiguous."""
+    raw = os.getenv("GOOGLE_DRIVE_CREDENTIALS_JSON")
+    if not raw:
+        raise RuntimeError("GOOGLE_DRIVE_CREDENTIALS_JSON env var not set")
+
+    raw = raw.strip()
+
+    # Looks like a file path (not starting with '{') - try reading it.
+    if not raw.startswith("{"):
+        path = Path(raw)
+        if not path.exists():
+            raise RuntimeError(
+                f"GOOGLE_DRIVE_CREDENTIALS_JSON is set to '{raw}', which "
+                f"looks like a file path but doesn't exist on disk. If you "
+                f"meant to paste JSON content directly instead, it must "
+                f"start with '{{' - check for accidental line breaks."
+            )
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"File at '{raw}' isn't valid JSON: {e}")
+
+    # Starts with '{' - treat as raw JSON content pasted into .env.
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"GOOGLE_DRIVE_CREDENTIALS_JSON isn't valid JSON ({e}). If "
+            f"pasting the content directly is proving fragile (a common "
+            f"issue - the key contains escaped newlines some apps corrupt "
+            f"on copy/paste), try uploading the .json file via HidenCloud's "
+            f"File Manager instead and point this variable at its file "
+            f"path, e.g. /home/container/gdrive-credentials.json"
+        )
 
 
 def _get_service():
@@ -62,26 +97,13 @@ def _get_service():
             "google-auth google-auth-httplib2 google-api-python-client"
         )
 
-    creds_json = os.getenv("GOOGLE_DRIVE_CREDENTIALS_JSON")
-    if not creds_json:
-        raise RuntimeError("GOOGLE_DRIVE_CREDENTIALS_JSON env var not set")
-
-    try:
-        creds_info = json.loads(creds_json)
-    except json.JSONDecodeError as e:
-        # Deliberately don't include creds_json in the error - even a
-        # malformed key is still sensitive and shouldn't hit logs.
-        raise RuntimeError(
-            f"GOOGLE_DRIVE_CREDENTIALS_JSON isn't valid JSON ({e}). "
-            f"Check it was pasted as one unbroken block into .env, with "
-            f"no accidental line breaks in the middle."
-        )
+    creds_info = _load_credentials_info()
 
     required_fields = ["type", "private_key", "client_email"]
     missing = [f for f in required_fields if f not in creds_info]
     if missing:
         raise RuntimeError(
-            f"GOOGLE_DRIVE_CREDENTIALS_JSON is missing field(s): {missing}. "
+            f"Credentials are missing field(s): {missing}. "
             f"This doesn't look like a complete service account key."
         )
 
@@ -272,8 +294,6 @@ if __name__ == "__main__":
     print("  GOOGLE DRIVE ADAPTER - STANDALONE TEST")
     print("=" * 54)
 
-    # Fail fast with a clear message if credentials don't even load,
-    # before attempting any real Drive operations.
     try:
         _get_service()
         print("\n[0] Credentials loaded and authenticated successfully.")

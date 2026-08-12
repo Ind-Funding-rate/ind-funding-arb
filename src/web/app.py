@@ -36,19 +36,17 @@ about which side has the lower/higher PRICE. For a funding-rate hedge,
 it means something different: "cheap" = the exchange with the LOWER
 funding rate (go long/buy there), "expensive" = the exchange with the
 HIGHER funding rate (go short/sell there) - that direction is what
-actually captures the funding differential. The function itself doesn't
-care why you picked a direction, it just walks the real order book for
-whichever two exchanges + direction it's given, so no changes to
-orderbook_depth.py or the /spread-scanner/real-cost endpoint were
-needed - only new server-side logic here to compute the RIGHT direction
-for a funding trade instead of a price trade, and a relabeled panel
-("execution cost", not "buy cheap/sell expensive") to avoid confusing
-the two concepts. IMPORTANT: this panel shows EXECUTION cost only (fees
-+ slippage to open AND close) - it does NOT include the funding payments
-themselves, which accrue over however many periods you hold the
-position. The two numbers are meant to be compared, not merged - the
-main table's Net % already includes funding minus fees; this panel adds
-the slippage piece that Net % was missing, as its own separate number.
+actually captures the funding differential.
+
+2026-08-02 addition - inline "Net (real)" column on Spread Scanner: a
+new /spread-scanner/real-cost-batch endpoint (POST) computes real cost
+for MULTIPLE coins concurrently via compute_real_cost_batch() (thread
+pool in orderbook_depth.py), used by that page's JS to populate every
+visible row's real net% automatically on the same 4s cadence as the
+price scan - an explicit, heavier-load tradeoff requested directly,
+see spread_scanner.py's module docstring for the full reasoning. The
+single-coin /spread-scanner/real-cost endpoint (used by the "Real Cost"
+button's detail panel on all 3 pages) is unchanged.
 
 ============================================================
 COORDINATION NOTE (2026-07-31) - both Claude and Codex edit this file
@@ -59,11 +57,12 @@ mid-change here. The current, agreed state as of this edit:
     Backtest pages) - do not remove without asking first.
   - Visual theme is the Loris Tools-inspired dark terminal redesign
     (BASE_CSS below) - do not silently revert to a plainer theme.
-  - Spread Scanner (multi-exchange checkbox version) is meant to stay.
+  - Spread Scanner (multi-exchange checkbox version, now with inline
+    Net (real) column) is meant to stay.
   - Test Runner (/admin/test) is meant to stay - it's the fix for the
     "testing stops the live site" problem, don't remove.
-  - Real Cost calculator - now present on Spread Scanner, Scanner, AND
-    Indian Opportunities (added 2026-08-01) - meant to stay on all three.
+  - Real Cost calculator - present on Spread Scanner, Scanner, AND
+    Indian Opportunities - meant to stay on all three.
 ============================================================
 
 Binds to whatever port HidenCloud/Pterodactyl assigns via the SERVER_PORT
@@ -103,7 +102,7 @@ from src.web.spread_scanner import (
     render_spread_scanner_page, get_spread_rows, get_cache_status,
     start_spread_background_loop, EXCHANGES as SPREAD_EXCHANGES,
 )
-from src.data.orderbook_depth import compute_real_cost
+from src.data.orderbook_depth import compute_real_cost, compute_real_cost_batch
 
 app = Flask(__name__)
 
@@ -430,13 +429,6 @@ def spread_bar(net_pct, css_class, max_scale=0.3):
     )
 
 
-# ── Real Cost panel + JS, shared by Scanner and Indian Opportunities ──
-# (Spread Scanner has its own copy - tightly bound to that page's own
-# element IDs/table - this is a fresh copy scoped for these two pages,
-# both hitting the SAME generic /spread-scanner/real-cost endpoint.
-# Labeled "execution cost" here rather than "buy cheap/sell expensive",
-# since for a funding trade the direction is about rate, not price, and
-# conflating the two would be misleading.)
 REAL_COST_PANEL_HTML = """
 <div id="real-cost-panel" class="rc-panel">
   <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; flex-wrap:wrap; gap:10px;">
@@ -1281,6 +1273,27 @@ def spread_scanner_real_cost_route():
 
     result = compute_real_cost(coin, exchange_cheap, exchange_expensive, position_usd)
     return jsonify(result)
+
+
+@app.route("/spread-scanner/real-cost-batch", methods=["POST"])
+def spread_scanner_real_cost_batch_route():
+    payload = request.get_json(force=True, silent=True) or {}
+    raw_items = payload.get("items", [])
+    position_usd = float(payload.get("position", 1000) or 1000)
+
+    clean_items = []
+    for it in raw_items:
+        coin = str(it.get("coin", "")).upper()
+        ec = it.get("exchange_cheap", "")
+        ee = it.get("exchange_expensive", "")
+        if coin and ec in SPREAD_EXCHANGES and ee in SPREAD_EXCHANGES:
+            clean_items.append({"coin": coin, "exchange_cheap": ec, "exchange_expensive": ee})
+
+    if not clean_items:
+        return jsonify({"results": {}})
+
+    results = compute_real_cost_batch(clean_items, position_usd)
+    return jsonify({"results": results})
 
 
 @app.route("/backtest")

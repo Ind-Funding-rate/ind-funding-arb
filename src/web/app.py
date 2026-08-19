@@ -48,6 +48,16 @@ see spread_scanner.py's module docstring for the full reasoning. The
 single-coin /spread-scanner/real-cost endpoint (used by the "Real Cost"
 button's detail panel on all 3 pages) is unchanged.
 
+2026-08-19 addition - Delta LIVE feed (Step 1 of real-time rebuild):
+src/feeds/delta_live_store.py runs Delta's already-existing (but
+previously unused) delta_client.listen() in its own background thread,
+giving sub-second price/funding updates completely separate from the
+90s full_market_scanner/three_way_scanner loops above, which are NOT
+being touched or replaced by this - both keep running in parallel.
+For now this only powers a debug JSON endpoint (/admin/delta-live) to
+confirm the live feed works correctly before anything on the actual
+site starts using it.
+
 ============================================================
 COORDINATION NOTE (2026-07-31) - both Claude and Codex edit this file
 independently in the same repo, and it's collided repeatedly. Before
@@ -103,6 +113,7 @@ from src.web.spread_scanner import (
     start_spread_background_loop, EXCHANGES as SPREAD_EXCHANGES,
 )
 from src.data.orderbook_depth import compute_real_cost, compute_real_cost_batch
+from src.feeds.delta_live_store import start_delta_live_feed, get_delta_live_data
 
 app = Flask(__name__)
 
@@ -1328,12 +1339,28 @@ def run_test_route():
     return render_run_test_route()
 
 
+@app.route("/admin/delta-live")
+def delta_live_debug_route():
+    """Step 1 test endpoint (2026-08-19) - confirms the new sub-second
+    Delta live feed is actually receiving data. Not used by any page
+    yet. Refresh this a few times and confirm price_age_seconds /
+    funding_age_seconds stay low (well under the old 90s cadence) -
+    that's the proof the live feed is genuinely working."""
+    data = get_delta_live_data()
+    sample = dict(list(data.items())[:10])
+    return jsonify({
+        "coin_count": len(data),
+        "sample": sample,
+    })
+
+
 if __name__ == "__main__":
     threading.Thread(target=background_scanner, daemon=True).start()
     threading.Thread(target=background_three_way_scanner, daemon=True).start()
     threading.Thread(target=ingestion_background, daemon=True).start()
     threading.Thread(target=ranking_background, daemon=True).start()
     start_spread_background_loop()
+    start_delta_live_feed()
 
     port = int(os.getenv("SERVER_PORT", 8080))
     print(f"Starting web dashboard on 0.0.0.0:{port}")

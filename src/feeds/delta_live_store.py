@@ -16,10 +16,17 @@ can speed up).
 
 Read the latest values with get_delta_live_data(). Start the background
 feed once, at app startup, with start_delta_live_feed().
+
+2026-08-29 - added flush=True + a broad try/except with full traceback
+printing around the thread's entire run, so if anything crashes before
+even reaching delta_client.py (e.g. building the pairs list), it prints
+loudly instead of the thread just silently dying with nothing visible
+in the console.
 """
 import threading
 import asyncio
 import time
+import traceback
 
 from src.feeds.delta_client import listen as delta_listen
 from src.execution.full_market_scanner import COINS
@@ -60,13 +67,20 @@ def _on_update(exchange, symbol, mark_price=None, funding_rate=None):
 
 
 def _run_forever():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    pairs = _build_pairs()
+    print("[delta-live] background thread started", flush=True)
     try:
-        loop.run_until_complete(delta_listen(pairs, _on_update))
-    finally:
-        loop.close()
+        pairs = _build_pairs()
+        print(f"[delta-live] built {len(pairs)} pairs from COINS list "
+              f"(e.g. {pairs[:2]})", flush=True)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(delta_listen(pairs, _on_update))
+        finally:
+            loop.close()
+    except Exception:
+        print("[delta-live] FATAL - background thread crashed:", flush=True)
+        traceback.print_exc()
 
 
 def start_delta_live_feed():
@@ -74,8 +88,10 @@ def start_delta_live_feed():
     than once - only actually starts the feed the first time."""
     global _started
     if _started:
+        print("[delta-live] start_delta_live_feed() called again, already running - skipping", flush=True)
         return
     _started = True
+    print("[delta-live] start_delta_live_feed() called - spawning thread", flush=True)
     t = threading.Thread(target=_run_forever, daemon=True, name="delta-live-feed")
     t.start()
 

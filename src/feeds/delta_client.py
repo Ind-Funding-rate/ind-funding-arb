@@ -5,6 +5,15 @@ Single responsibility: stay connected to Delta forever, and call on_update(...)
 whenever a mark_price or funding_rate update arrives for a tracked pair.
 Knows nothing about databases, files, or the rest of the app - just Delta's
 documented public WebSocket feed.
+
+2026-08-29 - added plain print() diagnostics (connect confirmation +
+first few raw messages) alongside the existing logger calls. The
+logger.info()/logger.warning() calls alone are silent by default (no
+handler configured at that level), which made a real "is this even
+connecting" question impossible to answer from server console output
+alone during Step 1 testing. These prints are intentionally bounded
+(only the first 5 raw messages) so they don't spam the live console
+forever.
 """
 import asyncio
 import json
@@ -30,6 +39,9 @@ async def listen(pairs, on_update):
     mark_lookup = {p["delta_mark_symbol"]: p["delta_symbol"] for p in pairs}
     delay = RECONNECT_DELAY
 
+    print(f"[delta_client] starting - tracking {len(pairs)} symbols "
+          f"(e.g. {funding_symbols[:3]})")
+
     while True:
         try:
             async with websockets.connect(DELTA_WS_URL) as ws:
@@ -43,11 +55,18 @@ async def listen(pairs, on_update):
                     },
                 }
                 await ws.send(json.dumps(sub_msg))
+                print(f"[delta_client] connected to {DELTA_WS_URL} and sent subscribe "
+                      f"request ({len(mark_symbols)} mark_price + {len(funding_symbols)} "
+                      f"funding_rate symbols)")
                 logger.info("connected")
                 delay = RECONNECT_DELAY
 
+                msg_count = 0
                 async for msg in ws:
                     data = json.loads(msg)
+                    msg_count += 1
+                    if msg_count <= 5:
+                        print(f"[delta_client] raw message #{msg_count}: {data}")
                     msg_type = data.get("type")
 
                     if msg_type == "mark_price":
@@ -59,6 +78,7 @@ async def listen(pairs, on_update):
                         on_update("Delta", data["symbol"], funding_rate=float(data.get("funding_rate", 0)))
 
         except Exception as e:
+            print(f"[delta_client] connection error: {e}. Reconnecting in {delay}s...")
             logger.warning(f"connection error: {e}. Reconnecting in {delay}s...")
             await asyncio.sleep(delay)
             delay = min(delay * 2, MAX_RECONNECT_DELAY)
